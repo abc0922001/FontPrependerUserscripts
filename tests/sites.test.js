@@ -337,4 +337,119 @@ describe('真實網站排版與邊界條件覆蓋測試 (Real-World Sites Covera
       expect(font).toContain('-apple-system');
     });
   });
+
+  // ---------------------------------------------------------------------------
+  // 7. X / Twitter (https://x.com/home)
+  // ---------------------------------------------------------------------------
+  describe('7. X / Twitter (https://x.com/home)', () => {
+    it('應正確前置 X (Twitter) 專有核心字型鏈（TwitterChirp 與 TwitterChirpExtendedHeavy）', () => {
+      const chirpStacks = [
+        'TwitterChirp, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif',
+        'TwitterChirpExtendedHeavy, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif',
+        'Chirp, "Helvetica Neue", sans-serif',
+        '"Chirp-Bold", sans-serif'
+      ];
+
+      for (const stack of chirpStacks) {
+        const prepended = prependFontFamily(stack);
+        expect(prepended.startsWith(SANS_PREPEND_STR)).toBe(true);
+        expect(prepended).toContain(stack);
+        expect(prepended).toContain('Google Sans');
+        expect(prepended).toContain('Noto Sans CJK TC');
+      }
+    });
+
+    it('應正確處理 React Native for Web 靜態樣式表與動態 insertRule 規則注入', () => {
+      const dom = new JSDOM('<!DOCTYPE html><html><head><style id="react-native-stylesheet"></style></head><body></body></html>', {
+        runScripts: 'dangerously'
+      });
+      const { window } = dom;
+      const { document, CSSStyleSheet } = window;
+
+      // 載入具備此 DOM 上下文的 Userscript
+      const scoped = loadUserscript({ window, document, CSSStyleSheet });
+      scoped.hookCSSPrototypes();
+
+      const styleEl = document.getElementById('react-native-stylesheet');
+      const sheet = styleEl.sheet;
+
+      // 1. 靜態規則改寫
+      sheet.insertRule('.css-1jxf684 { font-family: TwitterChirp, sans-serif; }', 0);
+      scoped.processStyleSheet(sheet);
+      expect(sheet.cssRules[0].style.getPropertyValue('font-family')).toContain('Google Sans');
+      expect(sheet.cssRules[0].style.getPropertyValue('font-family')).toContain('TwitterChirp');
+
+      // 2. 原型鏈動態 insertRule 攔截改寫（模擬虛擬滾動推文動態注入新 class 樣式）
+      sheet.insertRule('.r-18u37iz { font-family: TwitterChirpExtendedHeavy, sans-serif; }', 1);
+      const insertedRule = sheet.cssRules[1];
+      expect(insertedRule.style.getPropertyValue('font-family')).toContain('Google Sans');
+      expect(insertedRule.style.getPropertyValue('font-family')).toContain('TwitterChirpExtendedHeavy');
+    });
+
+    it('應覆蓋首頁虛擬滾動 Timeline 動態載入之推文行內樣式 (data-testid="tweetText")', () => {
+      const dom = new JSDOM(`<!DOCTYPE html><html><head></head><body>
+        <div aria-label="Timeline: Your Home Timeline">
+          <div data-testid="cellInnerDiv">
+            <article data-testid="tweet">
+              <div data-testid="tweetText" style="font-family: TwitterChirp, sans-serif;">
+                <span>Hello X.com World from FontPrepender!</span>
+              </div>
+            </article>
+          </div>
+        </div>
+      </body></html>`);
+
+      const { document } = dom.window;
+
+      // 執行行內樣式掃描與改寫
+      scanAndPatchInlineStyles(document);
+
+      const tweetText = document.querySelector('[data-testid="tweetText"]');
+      const fontVal = tweetText.style.getPropertyValue('font-family');
+
+      expect(fontVal.startsWith(SANS_PREPEND_STR)).toBe(true);
+      expect(fontVal).toContain('TwitterChirp');
+      expect(fontVal).toContain('Google Sans');
+    });
+
+    it('應正確將推文內之程式碼區塊與 monospace 等寬寫法判定為等寬字型', () => {
+      const xMonoStacks = [
+        'ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace',
+        'monospace, monospace',
+        '"Courier New", Courier, monospace',
+        'Consolas, "Liberation Mono", Menlo, Courier, monospace'
+      ];
+
+      for (const stack of xMonoStacks) {
+        const result = prependFontFamily(stack);
+        expect(result.startsWith(MONO_PREPEND_STR)).toBe(true);
+        expect(result).toContain('Intel One Mono');
+        expect(result).toContain('Noto Sans Mono CJK TC');
+      }
+    });
+
+    it('基礎降級樣式應涵蓋發文撰寫框 ([contenteditable="true"]) 與搜尋框 (input)', () => {
+      const dom = new JSDOM('<!DOCTYPE html><html><head></head><body></body></html>');
+      const { document } = dom.window;
+      const scoped = loadUserscript({ document, window: dom.window });
+
+      scoped.injectBaseStyles(document);
+
+      const baseStyle = document.querySelector('#font-prepender-base-style');
+      expect(baseStyle).not.toBeNull();
+      expect(baseStyle.textContent).toContain('contenteditable');
+      expect(baseStyle.textContent).toContain('input');
+      expect(baseStyle.textContent).toContain('textarea');
+    });
+
+    it('推文複合字型鏈中之 Emoji 回退字型應完整保留不被沖刷', () => {
+      const tweetEmojiStack = 'TwitterChirp, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Apple Color Emoji", "Segoe UI Emoji", sans-serif';
+      const result = prependFontFamily(tweetEmojiStack);
+
+      expect(result.startsWith(SANS_PREPEND_STR)).toBe(true);
+      expect(result).toContain('"Apple Color Emoji"');
+      expect(result).toContain('"Segoe UI Emoji"');
+      expect(result).toContain('TwitterChirp');
+    });
+  });
 });

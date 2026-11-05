@@ -233,6 +233,9 @@
 :where(h1, h2, h3, h4, h5, h6, p, blockquote, q, li, dt, dd, td, th, label, summary, details) {
   font-family: ${BASE_SANS_STACK};
 }
+:where(input, textarea, select, button, [contenteditable="true"]) {
+  font-family: ${BASE_SANS_STACK};
+}
 `;
       try {
         parent.appendChild(baseStyle);

@@ -31,7 +31,7 @@
 ├── tests/
 │   ├── parser.test.js          # 單元測試：字串解析、等寬判定、圖示排除、冪等性
 │   ├── dom.test.js             # 整合測試：DOM 注入、CSSOM 掃描、Shadow DOM、adoptedStyleSheets
-│   ├── sites.test.js           # 真實網站覆蓋測試：Cool3c、XDA、9to5Google、電腦王阿達、4gTV、UNIKO
+│   ├── sites.test.js           # 真實網站覆蓋測試：Cool3c、XDA、9to5Google、電腦王阿達、4gTV、UNIKO、X (Twitter)
 │   └── benchmark.perf.js       # 效能基準：解析吞吐量、CSSOM 耗時、DOM 突發、記憶體洩漏
 ├── scripts/
 │   └── check.js                # 語法正確性自動檢驗腳本
@@ -98,7 +98,7 @@ npm run check
 ```bash
 npm run test
 ```
-* **驗收標準**：`tests/parser.test.js`、`tests/dom.test.js` 與 `tests/sites.test.js` 全部 42 項測試綠燈通過。
+* **驗收標準**：`tests/parser.test.js`、`tests/dom.test.js` 與 `tests/sites.test.js` 全部 48 項測試綠燈通過。
 
 ### 5.3 量化效能評估 (Performance Benchmark)
 ```bash
