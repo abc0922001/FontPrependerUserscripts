@@ -5,6 +5,7 @@ const targetFiles = [
   'src/FontPrepender.user.js',
   'tests/parser.test.js',
   'tests/dom.test.js',
+  'tests/sites.test.js',
   'tests/benchmark.perf.js'
 ];
 

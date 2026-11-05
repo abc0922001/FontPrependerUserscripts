@@ -56,7 +56,7 @@
   const MONO_FONT_REGEX = /\b(?:monospace|ui-monospace|consolas|monaco|menlo|courier|fira\s*code|jetbrains\s*mono|source\s*code\s*pro|sfmono-regular|cascadia|inconsolata|ubuntu\s*mono|roboto\s*mono)\b/i;
 
   // 排除圖示與特殊字型特徵
-  const ICON_PATTERN_REGEX = /icon|fa-|fontawesome|material-icons|material-symbols|glyph|symbol|codicon|feather|icomoon|dashicons|octicons|fontello|ionicons|typicons|entypo/i;
+  const ICON_PATTERN_REGEX = /icon|fa-|fontawesome|material-icons|material-symbols|glyph|symbol|codicon|feather|icomoon|dashicons|octicons|fontello|ionicons|typicons|entypo|flowplayer/i;
 
   // CSS 保留系統關鍵字
   const CSS_SYSTEM_KEYWORDS_REGEX = /^(?:inherit|initial|unset|revert|revert-layer)$/i;
@@ -96,8 +96,12 @@
     if (selector && ICON_PATTERN_REGEX.test(selector)) {
       return true;
     }
-    if (fontFamily && ICON_PATTERN_REGEX.test(fontFamily)) {
-      return true;
+    if (fontFamily) {
+      // 容錯防禦：過濾現代系統字型鏈末端常見之 "Segoe UI Symbol" 符號降級，避免誤判為純圖示字型
+      const filteredFamily = fontFamily.replace(/['"]?segoe\s+ui\s+symbol['"]?/gi, '');
+      if (ICON_PATTERN_REGEX.test(filteredFamily)) {
+        return true;
+      }
     }
     return false;
   }
