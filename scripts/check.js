@@ -1,5 +1,5 @@
-import { readFileSync, existsSync } from 'node:fs';
-import { compileFunction } from 'node:vm';
+import { existsSync } from 'node:fs';
+import { execFileSync } from 'node:child_process';
 
 const targetFiles = [
   'src/FontPrepender.user.js',
@@ -13,11 +13,10 @@ let hasErrors = false;
 for (const file of targetFiles) {
   if (!existsSync(file)) continue;
   try {
-    const code = readFileSync(file, 'utf8');
-    compileFunction(code, [], { parsingContext: undefined });
+    execFileSync(process.execPath, ['--check', file], { stdio: 'pipe' });
     console.log(`[check] OK: ${file}`);
   } catch (err) {
-    console.error(`[check] Syntax Error in ${file}:`, err);
+    console.error(`[check] Syntax Error in ${file}:`, err.stderr?.toString() || err.message);
     hasErrors = true;
   }
 }

@@ -112,7 +112,7 @@
     if (selector && MONO_SELECTOR_REGEX.test(selector)) {
       return true;
     }
-    if (fontFamily && MONO_FONT_REGEX.test(fontFamily)) {
+    if (fontFamily && (MONO_FONT_REGEX.test(fontFamily) || /var\([^)]*(?:mono|code)/i.test(fontFamily))) {
       return true;
     }
     return false;
