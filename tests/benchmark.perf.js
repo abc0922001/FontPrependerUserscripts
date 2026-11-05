@@ -16,8 +16,16 @@ function loadUserscript(sandbox = {}) {
   return module.exports;
 }
 
-const fontPrepender = loadUserscript();
-const { prependFontFamily, processRules } = fontPrepender;
+let capturedObserverCallback = null;
+class MockMutationObserver {
+  constructor(cb) {
+    capturedObserverCallback = cb;
+  }
+  observe() {}
+}
+
+const fontPrepender = loadUserscript({ MutationObserver: MockMutationObserver });
+const { prependFontFamily, processRules, observeStyleSheets } = fontPrepender;
 
 console.log('====================================================');
 console.log('FontPrepender 效能評估與壓力測試 (Performance Benchmark)');
@@ -110,7 +118,9 @@ const mutationBatch = [];
 for (let i = 0; i < 5000; i++) {
   mutationBatch.push({
     nodeType: 1,
-    tagName: i % 500 === 0 ? 'DIV' : 'SPAN'
+    tagName: i % 500 === 0 ? 'DIV' : 'SPAN',
+    firstElementChild: null,
+    hasAttribute: () => false
   });
 }
 mockMutations.push({
@@ -118,23 +128,16 @@ mockMutations.push({
   addedNodes: mutationBatch
 });
 
-// 模擬 MutationObserver 回呼函式的高負載執行
+const mockDoc = {
+  documentElement: {},
+  styleSheets: [],
+  querySelectorAll: () => []
+};
+observeStyleSheets(mockDoc);
+
+// 呼叫真實 observeStyleSheets 註冊之 MutationObserver 回呼函式進行高負載執行測試
 const startMutation = performance.now();
-let shouldScan = false;
-for (let i = 0; i < mockMutations.length; i++) {
-  const mutation = mockMutations[i];
-  if (mutation.type === 'childList') {
-    const nodes = mutation.addedNodes;
-    for (let j = 0; j < nodes.length; j++) {
-      const node = nodes[j];
-      if (node.nodeType !== 1) continue;
-      const tagName = node.tagName.toLowerCase();
-      if (tagName === 'style') {
-        shouldScan = true;
-      }
-    }
-  }
-}
+capturedObserverCallback(mockMutations);
 const endMutation = performance.now();
 const mutationDuration = endMutation - startMutation;
 
