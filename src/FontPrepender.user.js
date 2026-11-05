@@ -60,6 +60,9 @@
   // 排除圖示與特殊字型特徵
   const ICON_PATTERN_REGEX = /icon|fa-|fontawesome|material-icons|material-symbols|glyph|symbol|codicon|feather|icomoon|dashicons|octicons|fontello|ionicons|typicons|entypo|flowplayer/i;
 
+  // 具體標準正文與中文字型特徵（排除純 generic-family 關鍵字如 sans-serif/serif）
+  const SPECIFIC_TEXT_FONT_REGEX = /(?:apple\s*lihei|microsoft\s*jhenghei|noto\s*sans|pingfang|heiti|system-ui|-apple-system|blinkmacsystemfont|roboto|arial|helvetica|segoe\s*ui|ubuntu|cantarell|meiryo)/i;
+
   // CSS 保留系統關鍵字
   const CSS_SYSTEM_KEYWORDS_REGEX = /^(?:inherit|initial|unset|revert|revert-layer)$/i;
 
@@ -96,16 +99,26 @@
    * @returns {boolean} 是否為圖示字型
    */
   function isIconFont(selector = '', fontFamily = '') {
-    if (selector && ICON_PATTERN_REGEX.test(selector)) {
+    const filteredFamily = fontFamily ? fontFamily.replace(/['"]?segoe\s+ui\s+symbol['"]?/gi, '').trim() : '';
+
+    // 1. 若字型名稱本身即為知名圖示庫（如 FontAwesome, Material Icons, icomoon, flowplayer）
+    if (filteredFamily && ICON_PATTERN_REGEX.test(filteredFamily)) {
       return true;
     }
-    if (fontFamily) {
-      // 容錯防禦：過濾現代系統字型鏈末端常見之 "Segoe UI Symbol" 符號降級，避免誤判為純圖示字型
-      const filteredFamily = fontFamily.replace(/['"]?segoe\s+ui\s+symbol['"]?/gi, '');
-      if (ICON_PATTERN_REGEX.test(filteredFamily)) {
-        return true;
+
+    // 2. 檢查選擇器特徵（若為群組選擇器，需所有子選擇器皆為圖示才視為圖示保護規則）
+    if (selector) {
+      const parts = selector.split(',');
+      const allAreIcons = parts.length > 0 && parts.every((part) => ICON_PATTERN_REGEX.test(part.trim()));
+      if (allAreIcons) {
+        // 若字型名稱僅為 generic-family (如 sans-serif) 或空，仍視為圖示保護規則
+        // 但若已明示包含具體正文字型鏈 (如 "Apple Lihei Pro", "Microsoft JhengHei")，則絕非純圖示
+        if (!SPECIFIC_TEXT_FONT_REGEX.test(filteredFamily)) {
+          return true;
+        }
       }
     }
+
     return false;
   }
 
@@ -463,17 +476,17 @@
 
   /**
    * 特例二：針對含有跨域樣式表的頁面，在主執行緒空閒時進行計算樣式抽樣修補
-   * 涵蓋 h1-h6、文章標題卡片（如 XDA）、連結與正文區塊
+   * 涵蓋 h1-h6、文章標題卡片（如 XDA）、連結、內文與發布日期/後設資料（解決 UNIKO 等 CMS 之 .jeg_meta_date / .jeg_post_meta）
    */
   function patchComputedStyles() {
     if (typeof document === 'undefined' || typeof window === 'undefined') return;
 
-    // 涵蓋全階層標題 (h1-h6)、文章卡片、標題容器、連結、內文與列表
+    // 涵蓋全階層標題 (h1-h6)、文章卡片、標題容器、連結、內文、代碼塊與文章後設資料 (日期、作者、時間標籤)
     const sampleTargets = document.querySelectorAll(
-      'h1, h2, h3, h4, h5, h6, [class*="title"], [class*="heading"], [class*="card"] a, [class*="post"] a, main, article, section, header, p, code, pre, [class*="content"], [class*="editor"]'
+      'h1, h2, h3, h4, h5, h6, [class*="title"], [class*="heading"], [class*="card"] a, [class*="post"] a, main, article, section, header, p, code, pre, [class*="content"], [class*="editor"], time, [class*="date"], [class*="meta"], [class*="author"], [class*="byline"], [class*="time"], [class*="published"]'
     );
 
-    const count = Math.min(sampleTargets.length, 300);
+    const count = Math.min(sampleTargets.length, 500);
     for (let i = 0; i < count; i++) {
       const el = sampleTargets[i];
       if (!el || processedElements.has(el)) continue;
@@ -494,11 +507,16 @@
             const prependStr = isMono ? MONO_PREPEND_STR : SANS_PREPEND_STR;
             el.style.setProperty('font-family', `${prependStr}${computedFont}`, 'important');
 
-            // 若父容器為標題且包含 a 標籤，同步確保 a 標籤不被其他預設樣式覆蓋
-            const childLink = el.querySelector ? el.querySelector('a') : null;
-            if (childLink && !processedElements.has(childLink)) {
-              processedElements.add(childLink);
-              childLink.style.setProperty('font-family', `${prependStr}${computedFont}`, 'important');
+            // 若父容器為標題或元數據容器且包含 a、span、time 標籤，同步確保內部文字節點套用前置字型
+            const childElements = el.querySelectorAll ? el.querySelectorAll('a, span, time') : null;
+            if (childElements && childElements.length) {
+              for (let c = 0; c < childElements.length; c++) {
+                const child = childElements[c];
+                if (!processedElements.has(child)) {
+                  processedElements.add(child);
+                  child.style.setProperty('font-family', `${prependStr}${computedFont}`, 'important');
+                }
+              }
             }
           }
         }
@@ -520,10 +538,12 @@
       patchComputedStyles();
     };
 
-    if (typeof window.requestIdleCallback === 'function') {
+    if (typeof window !== 'undefined' && typeof window.requestIdleCallback === 'function') {
       window.requestIdleCallback(runner, { timeout: 1500 });
-    } else {
+    } else if (typeof setTimeout === 'function') {
       setTimeout(runner, 120);
+    } else {
+      runner();
     }
   }
 
@@ -726,19 +746,15 @@
         injectBaseStyles(document);
         scanAndPatchStyleSheets(document);
         scanAndPatchInlineStyles(document);
-        if (hasCorsSheets) {
-          scheduleIdleComputedStylePatch();
-        }
+        scheduleIdleComputedStylePatch();
       }, { once: true });
     }
 
-    // 8. window load 完成後若有 CORS 樣式表，執行一次 computed style patch
+    // 8. window load 完成後執行一次 computed style patch，確保動態組件與後設資料完整前置
     if (typeof window !== 'undefined') {
       window.addEventListener('load', () => {
         scanAndPatchInlineStyles(document);
-        if (hasCorsSheets) {
-          scheduleIdleComputedStylePatch();
-        }
+        scheduleIdleComputedStylePatch();
       }, { once: true });
     }
   }

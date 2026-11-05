@@ -10,6 +10,8 @@ function loadUserscript(sandbox = {}) {
     module,
     exports: module.exports,
     console,
+    setTimeout,
+    clearTimeout,
     ...sandbox
   });
   vm.runInContext(code, context);
@@ -335,6 +337,69 @@ describe('真實網站排版與邊界條件覆蓋測試 (Real-World Sites Covera
 
       expect(font.startsWith(SANS_PREPEND_STR)).toBe(true);
       expect(font).toContain('-apple-system');
+    });
+
+    it('應正確改寫群組選擇器下之文章日期規則（避免 .jeg_meta_date 因包含圖示類別而被誤判為純圖示）', () => {
+      const dom = new JSDOM('<!DOCTYPE html><html><head></head><body></body></html>');
+      const { document } = dom.window;
+      const styleEl = document.createElement('style');
+      styleEl.textContent = `
+        .jeg_meta_date i.fa, .jeg_meta_date {
+          font-family: "Apple Lihei Pro", "Microsoft JhengHei", "Noto Sands TC", Arial;
+        }
+      `;
+      document.head.appendChild(styleEl);
+
+      processStyleSheet(styleEl.sheet);
+
+      const rule = styleEl.sheet.cssRules[0];
+      const fontVal = rule.style.getPropertyValue('font-family');
+
+      expect(fontVal.startsWith(SANS_PREPEND_STR)).toBe(true);
+      expect(fontVal).toContain('Apple Lihei Pro');
+      expect(fontVal).toContain('Google Sans');
+      expect(fontVal).toContain('Noto Sans CJK TC');
+    });
+
+    it('應透過計算樣式修補 (patchComputedStyles) 正確覆蓋文章卡片發布日期與作者 (.jeg_meta_date 與 .jeg_post_meta)', () => {
+      const dom = new JSDOM(`<!DOCTYPE html><html><head></head><body>
+        <article class="jeg_post">
+          <h2 class="jeg_post_title"><a href="#">NVIDIA App 暗藏 GPU App Prioritization 新功能</a></h2>
+          <div class="jeg_post_meta">
+            <span class="jeg_meta_author"><a href="#">JC</a></span>
+            <span class="jeg_meta_date">2026-11-05</span>
+          </div>
+        </article>
+      </body></html>`);
+
+      const { window } = dom;
+      const { document } = window;
+      const scopedScript = loadUserscript({ window, document });
+
+      const origGetComputed = window.getComputedStyle;
+      window.getComputedStyle = (el) => {
+        if (el.matches && (el.matches('.jeg_post_meta, .jeg_meta_date, .jeg_meta_author, .jeg_meta_author a, h2 a') || el.closest('.jeg_post_meta'))) {
+          return { fontFamily: '"Apple Lihei Pro", "Microsoft JhengHei", "Noto Sands TC", Arial' };
+        }
+        return origGetComputed ? origGetComputed(el) : { fontFamily: 'sans-serif' };
+      };
+
+      scopedScript.patchComputedStyles();
+
+      const metaDate = document.querySelector('.jeg_meta_date');
+      const metaAuthor = document.querySelector('.jeg_meta_author a');
+
+      const dateFont = metaDate.style.getPropertyValue('font-family');
+      const authorFont = metaAuthor.style.getPropertyValue('font-family');
+
+      expect(dateFont.startsWith(SANS_PREPEND_STR)).toBe(true);
+      expect(dateFont).toContain('Apple Lihei Pro');
+      expect(dateFont).toContain('Google Sans');
+      expect(metaDate.style.getPropertyPriority('font-family')).toBe('important');
+
+      expect(authorFont.startsWith(SANS_PREPEND_STR)).toBe(true);
+      expect(authorFont).toContain('Apple Lihei Pro');
+      expect(authorFont).toContain('Google Sans');
     });
   });
 
