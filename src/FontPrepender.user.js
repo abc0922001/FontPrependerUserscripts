@@ -36,7 +36,7 @@
   'use strict';
 
   // --- 字型配置常數 ---
-  const SANS_FONTS = ['"Google Sans"', '"Noto Sans CJK TC"'];
+  const SANS_FONTS = ['"Google Sans"', '"Google Sans Flex"', '"Noto Sans CJK TC"', '"Noto Sans TC"'];
   const MONO_FONTS = ['"Intel One Mono"', '"Noto Sans Mono CJK TC"'];
 
   const SANS_PREPEND_STR = `${SANS_FONTS.join(', ')}, `;
@@ -45,6 +45,10 @@
   // 基礎樣式注入字型鏈
   const BASE_SANS_STACK = `${SANS_FONTS.join(', ')}, sans-serif`;
   const BASE_MONO_STACK = `${MONO_FONTS.join(', ')}, monospace`;
+
+  // Google Fonts 線上字型注入常數
+  const GOOGLE_FONTS_LINK_ID = 'font-prepender-google-fonts';
+  const GOOGLE_FONTS_URL = 'https://fonts.googleapis.com/css2?family=Google+Sans+Flex:opsz,wght@6..144,1..1000&family=Google+Sans:ital,opsz,wght@0,17..18,400..700;1,17..18,400..700&family=Noto+Sans+TC:wght@100..900&display=swap';
 
   // 樣式元素識別 ID
   const BASE_STYLE_ID = 'font-prepender-base-style';
@@ -99,7 +103,7 @@
   const fontCache = new Map();
 
   // 冪等性快速前綴判定正則（O(1) 時間，零字串拷貝與配置開銷）
-  const ALREADY_SANS_REGEX = /^\s*['"]?\s*(?:google sans|noto sans cjk tc)/i;
+  const ALREADY_SANS_REGEX = /^\s*['"]?\s*(?:google sans(?: flex)?|noto sans(?: cjk)? tc)/i;
   const ALREADY_MONO_REGEX = /^\s*['"]?\s*(?:intel one mono|noto sans mono cjk tc)/i;
 
   // 是否存在跨域樣式表標記
@@ -331,12 +335,28 @@
   }
 
   /**
-   * 注入基礎層降級樣式與編輯器專屬樣式
+   * 注入基礎層降級樣式與編輯器專屬樣式（含 Google Fonts 線上樣式表）
    * @param {Document|ShadowRoot} targetRoot 注入目標根節點
    */
   function injectBaseStyles(targetRoot = document) {
     const parent = targetRoot.head || targetRoot.documentElement || targetRoot;
     if (!parent || !parent.appendChild) return;
+
+    // 0. 注入 Google Fonts 線上樣式表（若尚未注入）
+    if (!parent.querySelector || !parent.querySelector(`#${GOOGLE_FONTS_LINK_ID}`)) {
+      const fontLink = document.createElement('link');
+      fontLink.id = GOOGLE_FONTS_LINK_ID;
+      fontLink.rel = 'stylesheet';
+      fontLink.href = GOOGLE_FONTS_URL;
+      try {
+        parent.appendChild(fontLink);
+        if (fontLink.sheet) {
+          processedStyleSheets.add(fontLink.sheet);
+        }
+      } catch {
+        // 容錯防禦
+      }
+    }
 
     // 1. 注入基礎低優先度 :where 降級樣式（涵蓋常見文字區塊標籤，提供安全全站排版墊底）
     if (!parent.querySelector || !parent.querySelector(`#${BASE_STYLE_ID}`)) {
@@ -437,6 +457,13 @@
    */
   function processStyleSheet(sheet) {
     if (!sheet || processedStyleSheets.has(sheet)) {
+      return;
+    }
+
+    // 略過腳本自身注入之 Google Fonts 外部樣式表，避免誤判為跨域 CORS 樣式表
+    const owner = sheet.ownerNode;
+    if ((owner && owner.id === GOOGLE_FONTS_LINK_ID) || (sheet.href && sheet.href === GOOGLE_FONTS_URL)) {
+      processedStyleSheets.add(sheet);
       return;
     }
 
@@ -844,6 +871,10 @@
                 shouldScanStylesheets = true;
               }
             } else if ((tagName === 'LINK' || tagName === 'link') && node.rel === 'stylesheet') {
+              if (node.id === GOOGLE_FONTS_LINK_ID) {
+                if (node.sheet) processedStyleSheets.add(node.sheet);
+                continue;
+              }
               if (node.sheet) {
                 processStyleSheet(node.sheet);
               } else if (typeof node.addEventListener === 'function') {
@@ -936,6 +967,8 @@
       MONO_PREPEND_STR,
       BASE_SANS_STACK,
       BASE_MONO_STACK,
+      GOOGLE_FONTS_LINK_ID,
+      GOOGLE_FONTS_URL,
       isIconFont,
       isMonospace,
       isAlreadyPrepended,

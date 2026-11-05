@@ -53,9 +53,9 @@
 
 ## Steps
 
-- [ ] **Step 1**：先於 `main` 分支將 `tests/parser.test.js` 與 `tests/dom.test.js` 中寫死的 `'"Google Sans", "Noto Sans CJK TC"'` 斷言改為動態引用匯出的 `SANS_PREPEND_STR` 與 `BASE_SANS_STACK` 並提交，確保未來 `main` merge 至 `google-fonts` 分支時測試檔零衝突。
-- [ ] **Step 2**：自 `main` 切出新分支 `google-fonts`，在 `src/FontPrepender.user.js` 更新 `SANS_FONTS` 為 `['"Google Sans"', '"Google Sans Flex"', '"Noto Sans CJK TC"', '"Noto Sans TC"']`、更新 `ALREADY_SANS_REGEX`，並於 `injectBaseStyles` 加入 Google Fonts `<link>` 冪等注入與 `processStyleSheet` / `observeStyleSheets` 略過保護。
-- [ ] **Step 3**：在 `tests/dom.test.js` 新增驗證 `<link id="font-prepender-google-fonts">` 注入正確性之測試，執行 `npm run check`、`npm run test`、`npm run bench` 驗證 100% 通過後完成本地 Commit。
+- [x] **Step 1**：先於 `main` 分支將 `tests/parser.test.js` 與 `tests/dom.test.js` 中寫死的 `'"Google Sans", "Noto Sans CJK TC"'` 斷言改為動態引用匯出的 `SANS_PREPEND_STR` 與 `BASE_SANS_STACK` 並提交，確保未來 `main` merge 至 `google-fonts` 分支時測試檔零衝突。
+- [x] **Step 2**：自 `main` 切出新分支 `google-fonts`，在 `src/FontPrepender.user.js` 更新 `SANS_FONTS` 為 `['"Google Sans"', '"Google Sans Flex"', '"Noto Sans CJK TC"', '"Noto Sans TC"']`、更新 `ALREADY_SANS_REGEX`，並於 `injectBaseStyles` 加入 Google Fonts `<link>` 冪等注入與 `processStyleSheet` / `observeStyleSheets` 略過保護。
+- [x] **Step 3**：在 `tests/dom.test.js` 新增驗證 `<link id="font-prepender-google-fonts">` 注入正確性之測試，執行 `npm run check`、`npm run test`、`npm run bench` 驗證 100% 通過後完成本地 Commit。
 
 ---
 

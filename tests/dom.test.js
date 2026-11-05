@@ -155,4 +155,32 @@ describe('DOM / CSSOM 與特例整合測試', () => {
       ''
     );
   });
+
+  it('7. 應於 <head> 注入 Google Fonts 線上樣式表並維持冪等性與略過保護', () => {
+    const { document, exports } = createEnvironment();
+    exports.injectBaseStyles(document);
+
+    const fontLink = document.querySelector(`#${exports.GOOGLE_FONTS_LINK_ID}`);
+    expect(fontLink).not.toBeNull();
+    expect(fontLink.tagName).toBe('LINK');
+    expect(fontLink.rel).toBe('stylesheet');
+    expect(fontLink.href).toBe(exports.GOOGLE_FONTS_URL);
+
+    // 測試重複注入冪等性
+    exports.injectBaseStyles(document);
+    expect(document.querySelectorAll(`#${exports.GOOGLE_FONTS_LINK_ID}`).length).toBe(1);
+
+    // 驗證 processStyleSheet 略過保護：不存取 cssRules，不拋錯且不誤觸跨域處理
+    const mockGoogleFontsSheet = {
+      ownerNode: fontLink,
+      href: exports.GOOGLE_FONTS_URL,
+      get cssRules() {
+        throw new Error('SecurityError: Failed to read the cssRules property from CSSStyleSheet');
+      }
+    };
+
+    expect(() => {
+      exports.processStyleSheet(mockGoogleFontsSheet);
+    }).not.toThrow();
+  });
 });
