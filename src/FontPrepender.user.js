@@ -88,6 +88,14 @@
   const processedElements = new WeakSet();
   const fetchedStyleSheetUrls = new Set();
 
+  // LRU / FIFO 快取結構（O(1) 查詢，上限 1000 筆防止記憶體洩漏）
+  const MAX_CACHE_SIZE = 1000;
+  const fontCache = new Map();
+
+  // 冪等性快速前綴判定正則（O(1) 時間，零字串拷貝與配置開銷）
+  const ALREADY_SANS_REGEX = /^\s*['"]?\s*(?:google sans|noto sans cjk tc)/i;
+  const ALREADY_MONO_REGEX = /^\s*['"]?\s*(?:intel one mono|noto sans mono cjk tc)/i;
+
   // 是否存在跨域樣式表標記
   let hasCorsSheets = false;
   let isIdlePatchScheduled = false;
@@ -99,23 +107,33 @@
    * @returns {boolean} 是否為圖示字型
    */
   function isIconFont(selector = '', fontFamily = '') {
-    const filteredFamily = fontFamily ? fontFamily.replace(/['"]?segoe\s+ui\s+symbol['"]?/gi, '').trim() : '';
+    let hasIconName = false;
+    let isSpecificText = false;
 
-    // 1. 若字型名稱本身即為知名圖示庫（如 FontAwesome, Material Icons, icomoon, flowplayer）
-    if (filteredFamily && ICON_PATTERN_REGEX.test(filteredFamily)) {
-      return true;
-    }
-
-    // 2. 檢查選擇器特徵（若為群組選擇器，需所有子選擇器皆為圖示才視為圖示保護規則）
-    if (selector) {
-      const parts = selector.split(',');
-      const allAreIcons = parts.length > 0 && parts.every((part) => ICON_PATTERN_REGEX.test(part.trim()));
-      if (allAreIcons) {
-        // 若字型名稱僅為 generic-family (如 sans-serif) 或空，仍視為圖示保護規則
-        // 但若已明示包含具體正文字型鏈 (如 "Apple Lihei Pro", "Microsoft JhengHei")，則絕非純圖示
-        if (!SPECIFIC_TEXT_FONT_REGEX.test(filteredFamily)) {
+    if (fontFamily) {
+      if (ICON_PATTERN_REGEX.test(fontFamily)) {
+        // 僅在字型包含 segoe ui symbol 時執行正則替換排除，其餘情況零配置直接判斷
+        if (/segoe\s+ui\s+symbol/i.test(fontFamily)) {
+          const filteredFamily = fontFamily.replace(/['"]?segoe\s+ui\s+symbol['"]?/gi, '').trim();
+          if (filteredFamily && ICON_PATTERN_REGEX.test(filteredFamily)) {
+            return true;
+          }
+          if (SPECIFIC_TEXT_FONT_REGEX.test(filteredFamily)) {
+            isSpecificText = true;
+          }
+        } else {
           return true;
         }
+      } else if (SPECIFIC_TEXT_FONT_REGEX.test(fontFamily)) {
+        isSpecificText = true;
+      }
+    }
+
+    // 2. 檢查選擇器特徵（若命中圖示特徵，群組選擇器需全數為圖示且無正文字型鏈）
+    if (selector && ICON_PATTERN_REGEX.test(selector)) {
+      const allAreIcons = !selector.includes(',') || selector.split(',').every((part) => ICON_PATTERN_REGEX.test(part.trim()));
+      if (allAreIcons && !isSpecificText) {
+        return true;
       }
     }
 
@@ -140,21 +158,18 @@
 
   /**
    * 檢查字型字串是否已包含目標前置字型（冪等性防重複檢查）
+   * 以錨定正規表示式進行 O(1) 前綴匹配，免除全字串替換與轉小寫之記憶體配置
    * @param {string} fontFamily 原始字型字串
    * @param {boolean} isMono 是否為等寬字型
    * @returns {boolean} 是否已前置
    */
   function isAlreadyPrepended(fontFamily, isMono) {
     if (!fontFamily) return false;
-    const cleanStr = fontFamily.replace(/['"]/g, '').trim().toLowerCase();
-    if (isMono) {
-      return cleanStr.startsWith('intel one mono') || cleanStr.startsWith('noto sans mono cjk tc');
-    }
-    return cleanStr.startsWith('google sans') || cleanStr.startsWith('noto sans cjk tc');
+    return isMono ? ALREADY_MONO_REGEX.test(fontFamily) : ALREADY_SANS_REGEX.test(fontFamily);
   }
 
   /**
-   * 前置字型字串處理純函數
+   * 前置字型字串處理純函數（整合 O(1) Map 快取）
    * @param {string} fontFamily 原始 font-family 值
    * @param {string} [selector=''] 對應的選擇器（輔助判斷）
    * @returns {string} 前置處理後的 font-family 值
@@ -169,8 +184,19 @@
       return fontFamily;
     }
 
+    // 優先查詢 O(1) 快取
+    const cacheKey = selector ? `${selector}|${trimmed}` : trimmed;
+    const cached = fontCache.get(cacheKey);
+    if (cached !== undefined) {
+      return cached;
+    }
+
     // 特例一：圖示字型排除保護
     if (isIconFont(selector, trimmed)) {
+      if (fontCache.size >= MAX_CACHE_SIZE) {
+        fontCache.delete(fontCache.keys().next().value);
+      }
+      fontCache.set(cacheKey, fontFamily);
       return fontFamily;
     }
 
@@ -179,12 +205,22 @@
 
     // 冪等性防重複檢查
     if (isAlreadyPrepended(trimmed, mono)) {
+      if (fontCache.size >= MAX_CACHE_SIZE) {
+        fontCache.delete(fontCache.keys().next().value);
+      }
+      fontCache.set(cacheKey, fontFamily);
       return fontFamily;
     }
 
     // 特例三：若含有 CSS 變數 var(...)，在其前方前置依然是合法 CSS 語法
     const prependStr = mono ? MONO_PREPEND_STR : SANS_PREPEND_STR;
-    return `${prependStr}${trimmed}`;
+    const result = `${prependStr}${trimmed}`;
+
+    if (fontCache.size >= MAX_CACHE_SIZE) {
+      fontCache.delete(fontCache.keys().next().value);
+    }
+    fontCache.set(cacheKey, result);
+    return result;
   }
 
   /**
@@ -213,13 +249,15 @@
       });
     }
 
-    // 替換 font-family 宣告
-    result = result.replace(/font-family\s*:\s*([^;!}]+)(!important)?/gi, (match, fontVal, important) => {
-      if (!fontVal) return match;
-      const prepended = prependFontFamily(fontVal);
-      if (!prepended || prepended === fontVal) return match;
-      return `font-family: ${prepended}${important ? ' !important' : ''}`;
-    });
+    // 替換 font-family 宣告（若無關鍵字則 O(1) 短路跳過正則掃描）
+    if (result.includes('font-family')) {
+      result = result.replace(/font-family\s*:\s*([^;!}]+)(!important)?/gi, (match, fontVal, important) => {
+        if (!fontVal) return match;
+        const prepended = prependFontFamily(fontVal);
+        if (!prepended || prepended === fontVal) return match;
+        return `font-family: ${prepended}${important ? ' !important' : ''}`;
+      });
+    }
 
     return result;
   }
@@ -298,10 +336,11 @@
         }
 
         // B. 特例三：處理 CSS Custom Properties（例如 --font-sans, --code-font）
-        if (rule.style.length) {
-          for (let p = 0; p < rule.style.length; p++) {
+        const styleLen = rule.style.length;
+        if (styleLen) {
+          for (let p = 0; p < styleLen; p++) {
             const propName = rule.style[p];
-            if (propName && propName.startsWith('--') && CSS_VAR_FONT_REGEX.test(propName)) {
+            if (propName && propName.charCodeAt(0) === 45 && propName.charCodeAt(1) === 45 && CSS_VAR_FONT_REGEX.test(propName)) {
               const varVal = rule.style.getPropertyValue(propName);
               if (varVal && !CSS_SYSTEM_KEYWORDS_REGEX.test(varVal.trim())) {
                 const isMonoVar = /mono|code/i.test(propName) || isMonospace('', varVal);
@@ -420,17 +459,13 @@
       return;
     }
 
-    const selectorHint = (el.id ? `#${el.id}` : '') + (el.className && typeof el.className === 'string' ? `.${el.className.trim().split(/\s+/).join('.')}` : '') || (el.tagName ? el.tagName.toLowerCase() : '');
-    if (isIconFont(selectorHint, inlineFont)) {
+    // O(1) 快速前綴檢測：若已前置則立即退出，免除選擇器特徵提取與重複前置運算
+    if (ALREADY_SANS_REGEX.test(inlineFont) || ALREADY_MONO_REGEX.test(inlineFont)) {
       return;
     }
 
-    const isMono = el.matches ? (
-      el.matches('code, pre, kbd, samp, tt, var, .monospace, .code, .xterm') ||
-      MONO_FONT_REGEX.test(inlineFont)
-    ) : false;
-
-    if (isAlreadyPrepended(inlineFont, isMono)) {
+    const selectorHint = (el.id ? `#${el.id}` : '') + (el.className && typeof el.className === 'string' ? `.${el.className.trim().split(/\s+/).join('.')}` : '') || (el.tagName ? el.tagName.toLowerCase() : '');
+    if (isIconFont(selectorHint, inlineFont)) {
       return;
     }
 
@@ -501,20 +536,28 @@
             MONO_FONT_REGEX.test(computedFont)
           ) : false;
 
+          // 優先以 O(1) 前綴檢查是否已前置，命中時提早跳過免除選擇器特徵提取與重複運算
+          if (isAlreadyPrepended(computedFont, isMono)) {
+            continue;
+          }
+
           const selectorHint = (el.id ? `#${el.id}` : '') + (el.className && typeof el.className === 'string' ? `.${el.className.trim().split(/\s+/).join('.')}` : '') || (el.tagName ? el.tagName.toLowerCase() : '');
 
-          if (!isAlreadyPrepended(computedFont, isMono) && !isIconFont(selectorHint, computedFont)) {
+          if (!isIconFont(selectorHint, computedFont)) {
             const prependStr = isMono ? MONO_PREPEND_STR : SANS_PREPEND_STR;
             el.style.setProperty('font-family', `${prependStr}${computedFont}`, 'important');
 
             // 若父容器為標題或元數據容器且包含 a、span、time 標籤，同步確保內部文字節點套用前置字型
-            const childElements = el.querySelectorAll ? el.querySelectorAll('a, span, time') : null;
-            if (childElements && childElements.length) {
-              for (let c = 0; c < childElements.length; c++) {
-                const child = childElements[c];
-                if (!processedElements.has(child)) {
-                  processedElements.add(child);
-                  child.style.setProperty('font-family', `${prependStr}${computedFont}`, 'important');
+            const isContainer = el.matches ? el.matches('h1, h2, h3, h4, h5, h6, [class*="title"], [class*="heading"], [class*="card"], [class*="post"], [class*="meta"], [class*="byline"]') : true;
+            if (isContainer) {
+              const childElements = el.querySelectorAll ? el.querySelectorAll('a, span, time') : null;
+              if (childElements && childElements.length) {
+                for (let c = 0; c < childElements.length; c++) {
+                  const child = childElements[c];
+                  if (!processedElements.has(child)) {
+                    processedElements.add(child);
+                    child.style.setProperty('font-family', `${prependStr}${computedFont}`, 'important');
+                  }
                 }
               }
             }
@@ -680,14 +723,16 @@
         if (mutation.type === 'attributes' && mutation.attributeName === 'style') {
           patchElementInlineStyle(mutation.target);
         } else if (mutation.type === 'childList') {
-          for (let j = 0; j < mutation.addedNodes.length; j++) {
-            const node = mutation.addedNodes[j];
+          const added = mutation.addedNodes;
+          const addedLen = added.length;
+          for (let j = 0; j < addedLen; j++) {
+            const node = added[j];
             if (node.nodeType !== 1) continue;
-            const tagName = node.tagName.toLowerCase();
+            const tagName = node.tagName;
 
-            if (tagName === 'style') {
+            if (tagName === 'STYLE' || tagName === 'style') {
               shouldScanStylesheets = true;
-            } else if (tagName === 'link' && node.rel === 'stylesheet') {
+            } else if ((tagName === 'LINK' || tagName === 'link') && node.rel === 'stylesheet') {
               node.addEventListener('load', () => {
                 if (node.sheet) processStyleSheet(node.sheet);
               }, { once: true });
