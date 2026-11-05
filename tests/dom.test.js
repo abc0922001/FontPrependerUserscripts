@@ -44,8 +44,8 @@ describe('DOM / CSSOM 與特例整合測試', () => {
 
     const baseStyle = document.querySelector('#font-prepender-base-style');
     expect(baseStyle).not.toBeNull();
-    expect(baseStyle.textContent).toContain('"Google Sans", "Noto Sans CJK TC", sans-serif');
-    expect(baseStyle.textContent).toContain('"Intel One Mono", "Noto Sans Mono CJK TC", monospace');
+    expect(baseStyle.textContent).toContain(exports.BASE_SANS_STACK);
+    expect(baseStyle.textContent).toContain(exports.BASE_MONO_STACK);
 
     const editorStyle = document.querySelector('#font-prepender-editor-style');
     expect(editorStyle).not.toBeNull();

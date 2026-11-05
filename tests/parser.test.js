@@ -26,35 +26,35 @@ const {
 
 describe('字型堆疊解析與前置引擎 (Font Stack Parser & Prepender)', () => {
   describe('1. 一般字型前置測試', () => {
-    it('應正確前置 "Google Sans", "Noto Sans CJK TC" 至標準無襯線字型鏈', () => {
+    it('應正確前置一般無襯線首選字型至標準無襯線字型鏈', () => {
       const input = '"Arial", sans-serif';
-      const expected = '"Google Sans", "Noto Sans CJK TC", "Arial", sans-serif';
+      const expected = `${SANS_PREPEND_STR}"Arial", sans-serif`;
       expect(prependFontFamily(input)).toBe(expected);
     });
 
     it('應支援未加引號與單引號之字型名稱', () => {
       const input = "Helvetica, 'Microsoft JhengHei', sans-serif";
-      const expected = `"Google Sans", "Noto Sans CJK TC", Helvetica, 'Microsoft JhengHei', sans-serif`;
+      const expected = `${SANS_PREPEND_STR}Helvetica, 'Microsoft JhengHei', sans-serif`;
       expect(prependFontFamily(input)).toBe(expected);
     });
 
     it('系統通用字型如 system-ui 應前置一般字型', () => {
       const input = 'system-ui, -apple-system, BlinkMacSystemFont';
-      const expected = `"Google Sans", "Noto Sans CJK TC", system-ui, -apple-system, BlinkMacSystemFont`;
+      const expected = `${SANS_PREPEND_STR}system-ui, -apple-system, BlinkMacSystemFont`;
       expect(prependFontFamily(input)).toBe(expected);
     });
   });
 
   describe('2. 等寬與程式碼字型識別與前置測試', () => {
-    it('若 font-family 包含 Fira Code, monospace 應前置 Intel One Mono 與 Noto Sans Mono CJK TC', () => {
+    it('若 font-family 包含 Fira Code, monospace 應前置等寬首選字型', () => {
       const input = '"Fira Code", monospace';
-      const expected = '"Intel One Mono", "Noto Sans Mono CJK TC", "Fira Code", monospace';
+      const expected = `${MONO_PREPEND_STR}"Fira Code", monospace`;
       expect(prependFontFamily(input)).toBe(expected);
     });
 
     it('若 selector 符合 code 或 pre，即使字型未明示 monospace 也應前置等寬字型', () => {
       const input = 'sans-serif';
-      const expected = '"Intel One Mono", "Noto Sans Mono CJK TC", sans-serif';
+      const expected = `${MONO_PREPEND_STR}sans-serif`;
       expect(prependFontFamily(input, 'pre, code')).toBe(expected);
       expect(prependFontFamily(input, 'code')).toBe(expected);
       expect(prependFontFamily(input, '.blob-code')).toBe(expected);
@@ -86,7 +86,7 @@ describe('字型堆疊解析與前置引擎 (Font Stack Parser & Prepender)', ()
       const secondPass = prependFontFamily(firstPass);
       const thirdPass = prependFontFamily(secondPass);
 
-      expect(firstPass).toBe('"Google Sans", "Noto Sans CJK TC", "Arial", sans-serif');
+      expect(firstPass).toBe(`${SANS_PREPEND_STR}"Arial", sans-serif`);
       expect(secondPass).toBe(firstPass);
       expect(thirdPass).toBe(firstPass);
     });
@@ -96,13 +96,13 @@ describe('字型堆疊解析與前置引擎 (Font Stack Parser & Prepender)', ()
       const firstPass = prependFontFamily(input);
       const secondPass = prependFontFamily(firstPass);
 
-      expect(firstPass).toBe('"Intel One Mono", "Noto Sans Mono CJK TC", Consolas, monospace');
+      expect(firstPass).toBe(`${MONO_PREPEND_STR}Consolas, monospace`);
       expect(secondPass).toBe(firstPass);
     });
 
     it('直接傳入已包含目標字型的字串應被 isAlreadyPrepended 正確識別', () => {
-      expect(isAlreadyPrepended('"Google Sans", "Noto Sans CJK TC", sans-serif', false)).toBe(true);
-      expect(isAlreadyPrepended('"Intel One Mono", "Noto Sans Mono CJK TC", monospace', true)).toBe(true);
+      expect(isAlreadyPrepended(`${SANS_PREPEND_STR}sans-serif`, false)).toBe(true);
+      expect(isAlreadyPrepended(`${MONO_PREPEND_STR}monospace`, true)).toBe(true);
     });
   });
 
@@ -155,10 +155,10 @@ describe('字型堆疊解析與前置引擎 (Font Stack Parser & Prepender)', ()
 
     it('包含 var(--custom-font) 之 CSS 自訂變數應合法前置', () => {
       const sansVar = 'var(--font-sans)';
-      expect(prependFontFamily(sansVar)).toBe(`"Google Sans", "Noto Sans CJK TC", ${sansVar}`);
+      expect(prependFontFamily(sansVar)).toBe(`${SANS_PREPEND_STR}${sansVar}`);
 
       const monoVar = 'var(--font-mono)';
-      expect(prependFontFamily(monoVar)).toBe(`"Intel One Mono", "Noto Sans Mono CJK TC", ${monoVar}`);
+      expect(prependFontFamily(monoVar)).toBe(`${MONO_PREPEND_STR}${monoVar}`);
     });
   });
 });
