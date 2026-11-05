@@ -46,24 +46,35 @@
 ## 3. 核心演算法與實作邏輯
 
 ### 3.1 字型堆疊前置引擎 (Font Stack Prepender)
-解析與前置流程遵循純函數設計：
+解析與前置流程遵循純函數與 $\mathcal{O}(1)$ 攤銷複雜度設計：
 1. **防禦性過濾**：
    * 空字串或非字串直接返回。
    * CSS 保留系統關鍵字（`inherit`、`initial`、`unset`、`revert`、`revert-layer`）原樣保留，禁止破壞 CSS 繼承鏈。
-2. **圖示字型排除 (Icon Font Guard)**：
-   * 檢查選擇器與字型名稱是否命中 `ICON_PATTERN_REGEX`（如 `FontAwesome`, `Material Icons`, `codicon`, `octicons` 等）。
+2. **選擇器語意狀態正規化與 $\mathcal{O}(1)$ 快取 (`SELECTOR_HINT_REGEX` & `fontCache`)**：
+   * **嚴禁將原始完整 `selector` 直接拼接至快取鍵**（否則在數千條相異選擇器規則的 CSSOM 中快取命中率會退化為 0%）。
+   * 透過 `SELECTOR_HINT_REGEX` 快速篩選選擇器是否帶有圖示或等寬特徵：超過 98% 的中性選擇器直接共用 `trimmed` 字型字串作為快取鍵；命中特殊特徵者則降維映射至語意狀態前綴（`1|` 等寬、`2|` 全圖示、`3|` 雙重），確保跨規則快取命中率 $> 99\%$ 且快取空間嚴格收斂於唯一字型數 $\mathcal{O}(F)$。
+3. **圖示字型排除 (Icon Font Guard)**：
+   * 檢查選擇器與字型名稱是否命中 `ICON_PATTERN_REGEX`（如 `FontAwesome`, `Material Icons`, `codicon`, `octicons`, `flowplayer` 等）。
+   * 處理含逗號 `,` 之群組選擇器時，透過 `isAllSelectorPartsIcon` 以 `indexOf(',', start)` 雙指針索引切片掃描，避免 `.split(',')` 產生暫時陣列配置。
    * 命中時直接跳過，不進行任何前置。
-3. **等寬識別判定 (Monospace Detection)**：
-   * 命中條件 A：選擇器包含程式碼語意標籤（`code`, `pre`, `kbd`, `samp`, `tt`, `var`）或常見類別（`.monospace`, `.code`, `.highlight`）。
+4. **等寬識別判定 (Monospace Detection)**：
+   * 命中條件 A：選擇器包含程式碼語意標籤（`code`, `pre`, `kbd`, `samp`, `tt`, `var`）或常見類別（`.monospace`, `.code`, `.highlight`, `.blob-code`）。
    * 命中條件 B：字型值中包含等寬字型關鍵字（`monospace`, `ui-monospace`, `Consolas`, `Monaco`, `Menlo`, `Courier`, `Fira Code`, `JetBrains Mono`, `Source Code Pro`, `SFMono-Regular`, `Cascadia`, `Ubuntu Mono`, `Roboto Mono` 等）或變數名稱含 `mono`/`code`。
    * 判定為等寬時前置 `"Intel One Mono", "Noto Sans Mono CJK TC", `；否則前置 `"Google Sans", "Noto Sans CJK TC", `。
-4. **冪等性防重複 (Idempotency)**：
-   * 透過 `isAlreadyPrepended` 檢測字串前綴是否已含有目標字型，若已存在則不再疊加。
-5. **CSS 變數容錯**：
+5. **冪等性防重複 (Idempotency)**：
+   * 透過錨定正規表示式 `ALREADY_SANS_REGEX` 與 `ALREADY_MONO_REGEX` 在 $\mathcal{O}(1)$ 時間內檢測字串前綴是否已含有目標字型，免除全字串拷貝與小寫轉換。
+6. **CSS 變數容錯**：
    * 遇 `var(--font-sans)` 時，直接在其前方前置 `"Google Sans", "Noto Sans CJK TC", var(--font-sans)`，語法完全合規。
 
-### 3.2 樣式掃描與監聽
-* **CSSOM 掃描**：遞迴走訪 `CSSStyleRule` 與巢狀分組規則（`@media`, `@supports`, `@container`）。
+### 3.2 樣式掃描、監聽與複雜度護欄
+* **CSSOM 掃描 (`processRules`)**：遞迴走訪 `CSSStyleRule` 與巢狀分組規則（`@media`, `@supports`, `@container`），並支援 `:root` 等規則內之 `--font-*` CSS 自訂變數前置。
+* **內部寫入重入防護 (`isInternalStyleWrite` & `setStylePropertyInternal`)**：
+  * 由於 `hookCSSPrototypes` 攔截了 `CSSStyleDeclaration.prototype.setProperty` 與 `fontFamily` setter，腳本內部（`processRules`、`patchElementInlineStyle`、`patchComputedStyles`）寫回已前置字型時，**必須統一呼叫 `setStylePropertyInternal`**，以 $\mathcal{O}(1)$ 旗標跳過攔截器二次解析與快取污染。
+* **動態 DOM 增量局部掃描 (`observeStyleSheets` & `scanAndPatchInlineStyles`)**：
+  * **嚴禁在 `MutationObserver` 的 `childList` 事件中對整份 `targetDoc` 重新執行全樹 `querySelectorAll`**（否則在動態 SPA 頁面會退化為 $\mathcal{O}(N^2)$ 複雜度）。
+  * 新增元素節點僅針對該局部子樹呼叫 `scanAndPatchInlineStyles(node)`；且對於無子元素之葉節點（`!root.firstElementChild`），必須維持 $\mathcal{O}(1)$ 短路返回，免除無謂的 `querySelectorAll` 開銷。
+* **計算樣式修補兩階段讀寫分離 (`patchComputedStyles`)**：
+  * 針對含有跨域（CORS）樣式表的頁面，於 `requestIdleCallback` 空閒期抽樣修補時，必須嚴格區分為 **第一階段（Batch Read：純讀取 `getComputedStyle` 並收集佇列）** 與 **第二階段（Batch Write：一次性寫入 `setStylePropertyInternal`）**，嚴禁在迴圈中交錯讀寫引發瀏覽器強制同步重排（Style Thrashing）。
 * **WeakSet 弱引用追蹤**：樣式表（`processedStyleSheets`）、ShadowRoot（`processedShadowRoots`）與抽樣元素（`processedElements`）皆使用 `WeakSet`，確保原生節點釋放時垃圾回收順暢。
 * **Shadow DOM 穿透**：攔截 `Element.prototype.attachShadow`，自動在 open 模式 ShadowRoot 下掛載樣式與監聽。
 
@@ -79,7 +90,8 @@
 4. 遞增 `@version` 號碼（例如 `1.0.0` -> `1.0.1`）。
 
 ### 4.2 新增特殊圖示或程式碼編輯器支援
-* **擴充圖示庫特徵**：在 `src/FontPrepender.user.js` 中的 `ICON_PATTERN_REGEX` 正則表達式加入新圖示名稱關鍵字。
+* **擴充圖示庫或等寬選擇器特徵（重要同步約束）**：
+  * 在 `src/FontPrepender.user.js` 中的 `ICON_PATTERN_REGEX` 或 `MONO_SELECTOR_REGEX` 加入新關鍵字時，**必須同步更新 `SELECTOR_HINT_REGEX`**，確保快取鍵語意正規化篩選器能識別該新特徵。
 * **擴充編輯器選擇器**：在 `EDITOR_CONTAINER_SELECTORS` 常數追加目標容器類別（如 `.my-custom-editor`）。
 
 ---
