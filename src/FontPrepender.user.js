@@ -25,11 +25,12 @@
  * 1. 一般字型：前置 "Google Sans", "Noto Sans CJK TC"
  * 2. 等寬字型：前置 "Intel One Mono", "Noto Sans Mono CJK TC"
  * 3. 嚴格保護圖示字型 (Icon Fonts) 與專用區字型，避免符號破圖
- * 4. 跨域樣式表 (CORS) 安全捕捉與全階層標題/卡片計算樣式空閒修補
- * 5. 深度支援行內樣式 (Inline Style，含 !important) 自動掃描與動態監聽
- * 6. CSS 自訂變數 (--font-*) 智慧識別與前置
- * 7. 網頁程式碼編輯器 (Monaco, CodeMirror, Ace, xterm.js) 專屬樣式防護
- * 8. Shadow DOM (Web Components) 深度穿透與 adoptedStyleSheets 支援
+ * 4. 跨域樣式表 (CORS) 雙重防護：同源改寫 + Fetch CDN 改寫注入 + 空閒期計算樣式抽樣修補
+ * 5. 深度支援行內樣式 (Inline Style，含 !important) 自動掃描與動態屬性監聽
+ * 6. 原型鏈深度攔截：CSSStyleSheet (insertRule, replaceSync) 與 CSSStyleDeclaration (setProperty)
+ * 7. CSS 自訂變數 (--font-*) 智慧識別與前置
+ * 8. 網頁程式碼編輯器 (Monaco, CodeMirror, Ace, xterm.js) 專屬樣式防護
+ * 9. Shadow DOM (Web Components) 深度穿透與 adoptedStyleSheets 支援
  */
 (() => {
   'use strict';
@@ -82,6 +83,7 @@
   const processedStyleSheets = new WeakSet();
   const processedShadowRoots = new WeakSet();
   const processedElements = new WeakSet();
+  const fetchedStyleSheetUrls = new Set();
 
   // 是否存在跨域樣式表標記
   let hasCorsSheets = false;
@@ -173,6 +175,43 @@
   }
 
   /**
+   * 改寫文字版 CSS 內容（用於跨域樣式表重新載入注入或 replaceSync）
+   * @param {string} cssText 原始 CSS 文字
+   * @param {string} [baseUrl=''] 基礎路徑（修復相對 url 資源）
+   * @returns {string} 改寫後的 CSS 文字
+   */
+  function rewriteCssContent(cssText, baseUrl = '') {
+    if (!cssText || typeof cssText !== 'string') return cssText;
+
+    let result = cssText;
+    // 修復相對 url(...) 路徑
+    if (baseUrl && result.includes('url(')) {
+      result = result.replace(/url\(\s*(['"]?)(.*?)\1\s*\)/gi, (match, quote, rawUrl) => {
+        const trimmed = rawUrl.trim();
+        if (!trimmed || trimmed.startsWith('data:') || trimmed.startsWith('blob:') || trimmed.startsWith('#') || /^(?:https?:)?\/\//i.test(trimmed)) {
+          return match;
+        }
+        try {
+          const absUrl = new URL(trimmed, baseUrl).href;
+          return `url(${quote || '"'}${absUrl}${quote || '"'})`;
+        } catch {
+          return match;
+        }
+      });
+    }
+
+    // 替換 font-family 宣告
+    result = result.replace(/font-family\s*:\s*([^;!}]+)(!important)?/gi, (match, fontVal, important) => {
+      if (!fontVal) return match;
+      const prepended = prependFontFamily(fontVal);
+      if (!prepended || prepended === fontVal) return match;
+      return `font-family: ${prepended}${important ? ' !important' : ''}`;
+    });
+
+    return result;
+  }
+
+  /**
    * 注入基礎層降級樣式與編輯器專屬樣式
    * @param {Document|ShadowRoot} targetRoot 注入目標根節點
    */
@@ -180,7 +219,7 @@
     const parent = targetRoot.head || targetRoot.documentElement || targetRoot;
     if (!parent || !parent.appendChild) return;
 
-    // 1. 注入基礎低優先度 :where 降級樣式
+    // 1. 注入基礎低優先度 :where 降級樣式（涵蓋常見文字區塊標籤，提供安全全站排版墊底）
     if (!parent.querySelector || !parent.querySelector(`#${BASE_STYLE_ID}`)) {
       const baseStyle = document.createElement('style');
       baseStyle.id = BASE_STYLE_ID;
@@ -190,6 +229,9 @@
 }
 :where(code, pre, kbd, samp, tt, var) {
   font-family: ${BASE_MONO_STACK};
+}
+:where(h1, h2, h3, h4, h5, h6, p, blockquote, q, li, dt, dd, td, th, label, summary, details) {
+  font-family: ${BASE_SANS_STACK};
 }
 `;
       try {
@@ -279,9 +321,44 @@
     try {
       rules = sheet.cssRules;
     } catch {
-      // 特例二：跨域樣式表存取拋出 SecurityError，標記啟用空閒計算樣式修補
+      // 特例二：跨域樣式表存取拋出 SecurityError
       hasCorsSheets = true;
-      scheduleIdleComputedStylePatch();
+      processedStyleSheets.add(sheet);
+
+      // 若為外部 link 樣式表且支援 fetch，嘗試直接下載改寫注入（解決 XDA 等 CDN 外部樣式表）
+      const href = sheet.href;
+      const owner = sheet.ownerNode;
+      if (typeof fetch === 'function' && href && !fetchedStyleSheetUrls.has(href)) {
+        fetchedStyleSheetUrls.add(href);
+        fetch(href)
+          .then((res) => (res.ok ? res.text() : null))
+          .then((cssText) => {
+            if (!cssText || !cssText.includes('font-family')) return;
+            const rewritten = rewriteCssContent(cssText, href);
+            if (rewritten && rewritten !== cssText) {
+              const style = document.createElement('style');
+              style.setAttribute('data-prepended-source', href);
+              style.textContent = rewritten;
+
+              if (owner && owner.parentNode) {
+                owner.parentNode.insertBefore(style, owner.nextSibling);
+              } else {
+                const parent = document.head || document.documentElement;
+                if (parent) parent.appendChild(style);
+              }
+
+              if (style.sheet) {
+                processedStyleSheets.add(style.sheet);
+              }
+            }
+          })
+          .catch(() => {
+            // fetch 失敗時退避至空閒計算樣式修補
+            scheduleIdleComputedStylePatch();
+          });
+      } else {
+        scheduleIdleComputedStylePatch();
+      }
       return;
     }
 
@@ -476,6 +553,90 @@
   }
 
   /**
+   * 原型鏈 API 攔截層：攔截動態 insertRule, replaceSync 與 CSSStyleDeclaration.setProperty
+   * 確保 CSS-in-JS 與動態腳本產生的字型樣式第一時間被前置
+   */
+  function hookCSSPrototypes() {
+    // 1. 攔截 CSSStyleDeclaration.prototype.setProperty
+    try {
+      if (typeof CSSStyleDeclaration !== 'undefined' && CSSStyleDeclaration.prototype.setProperty) {
+        const origSetProperty = CSSStyleDeclaration.prototype.setProperty;
+        CSSStyleDeclaration.prototype.setProperty = function(prop, val, priority) {
+          if (prop === 'font-family' && typeof val === 'string' && val) {
+            const prepended = prependFontFamily(val);
+            if (prepended) val = prepended;
+          }
+          return origSetProperty.call(this, prop, val, priority);
+        };
+      }
+    } catch {
+      // 容錯防禦
+    }
+
+    // 2. 攔截 CSSStyleDeclaration.prototype.fontFamily setter
+    try {
+      if (typeof CSSStyleDeclaration !== 'undefined') {
+        const desc = Object.getOwnPropertyDescriptor(CSSStyleDeclaration.prototype, 'fontFamily');
+        if (desc && desc.set) {
+          const origSet = desc.set;
+          Object.defineProperty(CSSStyleDeclaration.prototype, 'fontFamily', {
+            get: desc.get,
+            set: function(val) {
+              if (typeof val === 'string' && val) {
+                const prepended = prependFontFamily(val);
+                if (prepended) val = prepended;
+              }
+              return origSet.call(this, val);
+            },
+            configurable: true,
+            enumerable: true
+          });
+        }
+      }
+    } catch {
+      // 容錯防禦
+    }
+
+    // 3. 攔截 CSSStyleSheet.prototype.insertRule
+    try {
+      if (typeof CSSStyleSheet !== 'undefined' && CSSStyleSheet.prototype.insertRule) {
+        const origInsertRule = CSSStyleSheet.prototype.insertRule;
+        CSSStyleSheet.prototype.insertRule = function(ruleText, index) {
+          if (typeof ruleText === 'string' && ruleText.includes('font-family')) {
+            try {
+              ruleText = rewriteCssContent(ruleText);
+            } catch {
+              // 容錯防禦
+            }
+          }
+          return origInsertRule.call(this, ruleText, index);
+        };
+      }
+    } catch {
+      // 容錯防禦
+    }
+
+    // 4. 攔截 CSSStyleSheet.prototype.replaceSync
+    try {
+      if (typeof CSSStyleSheet !== 'undefined' && CSSStyleSheet.prototype.replaceSync) {
+        const origReplaceSync = CSSStyleSheet.prototype.replaceSync;
+        CSSStyleSheet.prototype.replaceSync = function(text) {
+          if (typeof text === 'string' && text.includes('font-family')) {
+            try {
+              text = rewriteCssContent(text);
+            } catch {
+              // 容錯防禦
+            }
+          }
+          return origReplaceSync.call(this, text);
+        };
+      }
+    } catch {
+      // 容錯防禦
+    }
+  }
+
+  /**
    * 監聽樣式表動態插入與載入事件、行內樣式屬性變更
    * @param {Document|ShadowRoot} targetDoc 目標文件或根節點
    */
@@ -538,22 +699,25 @@
   function init() {
     if (typeof document === 'undefined') return;
 
-    // 1. 攔截 Shadow DOM
+    // 1. 原型鏈深度攔截
+    hookCSSPrototypes();
+
+    // 2. 攔截 Shadow DOM
     hookShadowDOM();
 
-    // 2. 注入基礎降級層與程式碼編輯器樣式
+    // 3. 注入基礎降級層與程式碼編輯器樣式
     injectBaseStyles(document);
 
-    // 3. 靜態同源 CSSOM 掃描
+    // 4. 靜態同源 CSSOM 掃描
     scanAndPatchStyleSheets(document);
 
-    // 4. 掃描行內樣式 (解決 UNIKO's Hardware 等 CMS 文章行內樣式覆寫)
+    // 5. 掃描行內樣式 (解決 UNIKO's Hardware 等 CMS 文章行內樣式覆寫)
     scanAndPatchInlineStyles(document);
 
-    // 5. 監聽動態樣式注入與行內樣式變更
+    // 6. 監聽動態樣式注入與行內樣式變更
     observeStyleSheets(document);
 
-    // 6. 若在 DOMContentLoaded 或 load 事件發生前載入，註冊生命週期鉤子再次掃描
+    // 7. 若在 DOMContentLoaded 或 load 事件發生前載入，註冊生命週期鉤子再次掃描
     if (document.readyState === 'loading') {
       document.addEventListener('DOMContentLoaded', () => {
         injectBaseStyles(document);
@@ -565,7 +729,7 @@
       }, { once: true });
     }
 
-    // 7. window load 完成後若有 CORS 樣式表，執行一次 computed style patch
+    // 8. window load 完成後若有 CORS 樣式表，執行一次 computed style patch
     if (typeof window !== 'undefined') {
       window.addEventListener('load', () => {
         scanAndPatchInlineStyles(document);
@@ -593,6 +757,7 @@
       isMonospace,
       isAlreadyPrepended,
       prependFontFamily,
+      rewriteCssContent,
       injectBaseStyles,
       processStyleSheet,
       processRules,
@@ -602,6 +767,7 @@
       patchComputedStyles,
       scheduleIdleComputedStylePatch,
       hookShadowDOM,
+      hookCSSPrototypes,
       observeStyleSheets,
       init
     };
