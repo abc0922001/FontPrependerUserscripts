@@ -1,4 +1,4 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
 import { JSDOM } from 'jsdom';
 import fs from 'node:fs';
 import vm from 'node:vm';
@@ -21,6 +21,10 @@ const {
   isIconFont,
   isMonospace,
   processStyleSheet,
+  patchElementInlineStyle,
+  scanAndPatchInlineStyles,
+  patchComputedStyles,
+  observeStyleSheets,
   SANS_PREPEND_STR,
   MONO_PREPEND_STR
 } = loadUserscript();
@@ -97,6 +101,45 @@ describe('真實網站排版與邊界條件覆蓋測試 (Real-World Sites Covera
       const result = prependFontFamily(codeStack);
       expect(result.startsWith(MONO_PREPEND_STR)).toBe(true);
       expect(result).toBe(`${MONO_PREPEND_STR}${codeStack}`);
+    });
+
+    it('應覆蓋 XDA 跨域樣式表下的 h5 文章標題與內部 a 連結（對應 issue/xda-developers.png）', () => {
+      // 模擬 XDA 頁面：CORS 樣式表無法直接讀取 cssRules，透過 patchComputedStyles 修補
+      const dom = new JSDOM(`<!DOCTYPE html><html><head></head><body>
+        <div class="display-card-content">
+          <h5 class="display-card-title">
+            <a href="/ditch-samsung-one-ui-launcher/">I ditched Samsung's One UI launcher for an open-source alternative</a>
+          </h5>
+          <p class="display-card-excerpt">An open-source makeover that unlocks custom icon packs...</p>
+        </div>
+      </body></html>`);
+
+      const { window } = dom;
+      const { document } = window;
+
+      // 載入具備此 DOM 上下文的 Userscript
+      const scopedScript = loadUserscript({ window, document });
+
+      // 模擬 window.getComputedStyle 在 XDA 頁面上的傳回值
+      const origGetComputed = window.getComputedStyle;
+      window.getComputedStyle = (el) => {
+        if (el.matches && (el.matches('h5, .display-card-title, a') || el.closest('.display-card-title'))) {
+          return { fontFamily: '"Titillium Web", sans-serif' };
+        }
+        return origGetComputed ? origGetComputed(el) : { fontFamily: 'sans-serif' };
+      };
+
+      scopedScript.patchComputedStyles();
+
+      const h5 = document.querySelector('h5.display-card-title');
+      const a = h5.querySelector('a');
+
+      expect(h5.style.getPropertyValue('font-family')).toContain('Google Sans');
+      expect(h5.style.getPropertyValue('font-family')).toContain('Titillium Web');
+      expect(h5.style.getPropertyPriority('font-family')).toBe('important');
+
+      expect(a.style.getPropertyValue('font-family')).toContain('Google Sans');
+      expect(a.style.getPropertyValue('font-family')).toContain('Titillium Web');
     });
   });
 
@@ -222,6 +265,44 @@ describe('真實網站排版與邊界條件覆蓋測試 (Real-World Sites Covera
       const result = prependFontFamily(trailingCommaStack);
       expect(result.startsWith(SANS_PREPEND_STR)).toBe(true);
       expect(result).toContain('BlinkMacSystemFont');
+    });
+
+    it('應正確改寫文章標題與內文直接宣告之行內樣式（對應 issue/unikoshardware.png 與 issue/unikoshardware2.png）', () => {
+      const dom = new JSDOM(`<!DOCTYPE html><html><head></head><body>
+        <div class="article-card">
+          <a href="/nvidia-app-gpu-app-prioritization" style="font-family: &quot;Apple Lihei Pro&quot;, &quot;Microsoft JhengHei&quot;, &quot;Noto Sands TC&quot;, Arial !important;">
+            NVIDIA App 暗藏 GPU App Prioritization 新功能，前後景資源能自己分配
+          </a>
+        </div>
+        <p dir="ltr">
+          NVIDIA App 更新到 11.0.9.585 版之後，
+          <a href="https://reddit.com" target="_blank" style="font-family: &quot;Apple Lihei Pro&quot;, &quot;Microsoft JhengHei&quot;, &quot;Noto Sands TC&quot;, Arial !important;">，Reddit 網友</a>
+          Warkratos 在「System」...
+        </p>
+      </body></html>`);
+
+      const { document } = dom.window;
+
+      // 執行行內樣式全域掃描與改寫
+      scanAndPatchInlineStyles(document);
+
+      const titleLink = document.querySelector('.article-card a');
+      const contentLink = document.querySelector('p a');
+
+      // 驗證首頁卡片標題連結的行內樣式
+      const titleFont = titleLink.style.getPropertyValue('font-family');
+      const titlePriority = titleLink.style.getPropertyPriority('font-family');
+      expect(titleFont.startsWith(SANS_PREPEND_STR)).toBe(true);
+      expect(titleFont).toContain('Apple Lihei Pro');
+      expect(titleFont).toContain('Microsoft JhengHei');
+      expect(titlePriority).toBe('important');
+
+      // 驗證內文中的 Reddit 網友超連結行內樣式
+      const contentFont = contentLink.style.getPropertyValue('font-family');
+      const contentPriority = contentLink.style.getPropertyPriority('font-family');
+      expect(contentFont.startsWith(SANS_PREPEND_STR)).toBe(true);
+      expect(contentFont).toContain('Noto Sands TC');
+      expect(contentPriority).toBe('important');
     });
 
     it('硬體評測規格表與代碼塊應維持等寬判定', () => {

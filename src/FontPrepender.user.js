@@ -25,10 +25,11 @@
  * 1. 一般字型：前置 "Google Sans", "Noto Sans CJK TC"
  * 2. 等寬字型：前置 "Intel One Mono", "Noto Sans Mono CJK TC"
  * 3. 嚴格保護圖示字型 (Icon Fonts) 與專用區字型，避免符號破圖
- * 4. 跨域樣式表 (CORS) 安全捕捉與空閒期計算樣式抽樣修補
- * 5. CSS 自訂變數 (--font-*) 智慧識別與前置
- * 6. 網頁程式碼編輯器 (Monaco, CodeMirror, Ace, xterm.js) 專屬樣式防護
- * 7. Shadow DOM (Web Components) 深度穿透與 adoptedStyleSheets 支援
+ * 4. 跨域樣式表 (CORS) 安全捕捉與全階層標題/卡片計算樣式空閒修補
+ * 5. 深度支援行內樣式 (Inline Style，含 !important) 自動掃描與動態監聽
+ * 6. CSS 自訂變數 (--font-*) 智慧識別與前置
+ * 7. 網頁程式碼編輯器 (Monaco, CodeMirror, Ace, xterm.js) 專屬樣式防護
+ * 8. Shadow DOM (Web Components) 深度穿透與 adoptedStyleSheets 支援
  */
 (() => {
   'use strict';
@@ -314,17 +315,85 @@
   }
 
   /**
+   * 處理單一 DOM 元素的行內樣式 font-family（支援 !important 優先級保留）
+   * 解決 UNIKO's Hardware 等 CMS 文章標題與連結直接嵌入 style="font-family: ... !important;" 的問題
+   * @param {HTMLElement} el 目標 DOM 元素
+   */
+  function patchElementInlineStyle(el) {
+    if (!el || !el.style || typeof el.style.getPropertyValue !== 'function') return;
+
+    const inlineFont = el.style.getPropertyValue('font-family');
+    if (!inlineFont || CSS_SYSTEM_KEYWORDS_REGEX.test(inlineFont.trim())) {
+      return;
+    }
+
+    const selectorHint = (el.id ? `#${el.id}` : '') + (el.className && typeof el.className === 'string' ? `.${el.className.trim().split(/\s+/).join('.')}` : '') || (el.tagName ? el.tagName.toLowerCase() : '');
+    if (isIconFont(selectorHint, inlineFont)) {
+      return;
+    }
+
+    const isMono = el.matches ? (
+      el.matches('code, pre, kbd, samp, tt, var, .monospace, .code, .xterm') ||
+      MONO_FONT_REGEX.test(inlineFont)
+    ) : false;
+
+    if (isAlreadyPrepended(inlineFont, isMono)) {
+      return;
+    }
+
+    const newFont = prependFontFamily(inlineFont, selectorHint);
+    if (newFont !== inlineFont) {
+      const priority = el.style.getPropertyPriority('font-family');
+      el.style.setProperty('font-family', newFont, priority);
+    }
+  }
+
+  /**
+   * 掃描並改寫所有帶有行內 font-family 樣式之元素
+   * @param {Document|Element|ShadowRoot} root 根節點
+   */
+  function scanAndPatchInlineStyles(root = document) {
+    if (!root) return;
+
+    // 若目標節點本身包含行內樣式
+    if (root.style && root.style.getPropertyValue && root.style.getPropertyValue('font-family')) {
+      patchElementInlineStyle(root);
+    }
+
+    if (typeof root.querySelectorAll !== 'function') return;
+
+    try {
+      const inlineElements = root.querySelectorAll('[style*="font-family" i]');
+      const len = inlineElements.length;
+      for (let i = 0; i < len; i++) {
+        patchElementInlineStyle(inlineElements[i]);
+      }
+    } catch {
+      try {
+        const fallbackEls = root.querySelectorAll('[style]');
+        const len = fallbackEls.length;
+        for (let i = 0; i < len; i++) {
+          patchElementInlineStyle(fallbackEls[i]);
+        }
+      } catch {
+        // 容錯防禦
+      }
+    }
+  }
+
+  /**
    * 特例二：針對含有跨域樣式表的頁面，在主執行緒空閒時進行計算樣式抽樣修補
+   * 涵蓋 h1-h6、文章標題卡片（如 XDA）、連結與正文區塊
    */
   function patchComputedStyles() {
     if (typeof document === 'undefined' || typeof window === 'undefined') return;
 
-    // 抽樣具備代表性的主要容器與文字區塊，避免全文件遍歷造成版面重繪壓力
+    // 涵蓋全階層標題 (h1-h6)、文章卡片、標題容器、連結、內文與列表
     const sampleTargets = document.querySelectorAll(
-      'main, article, section, header, nav, h1, h2, h3, p, code, pre, [class*="content"], [class*="editor"]'
+      'h1, h2, h3, h4, h5, h6, [class*="title"], [class*="heading"], [class*="card"] a, [class*="post"] a, main, article, section, header, p, code, pre, [class*="content"], [class*="editor"]'
     );
 
-    const count = Math.min(sampleTargets.length, 60); // 嚴格限制抽樣上限確保極佳效能
+    const count = Math.min(sampleTargets.length, 300);
     for (let i = 0; i < count; i++) {
       const el = sampleTargets[i];
       if (!el || processedElements.has(el)) continue;
@@ -332,16 +401,25 @@
 
       try {
         const computed = window.getComputedStyle(el);
-        const computedFont = computed.fontFamily;
+        const computedFont = computed ? computed.fontFamily : '';
         if (computedFont && !CSS_SYSTEM_KEYWORDS_REGEX.test(computedFont)) {
           const isMono = el.matches ? (
             el.matches('code, pre, kbd, samp, tt, var, .monospace, .code, .xterm') ||
             MONO_FONT_REGEX.test(computedFont)
           ) : false;
 
-          if (!isAlreadyPrepended(computedFont, isMono) && !isIconFont('', computedFont)) {
+          const selectorHint = (el.id ? `#${el.id}` : '') + (el.className && typeof el.className === 'string' ? `.${el.className.trim().split(/\s+/).join('.')}` : '') || (el.tagName ? el.tagName.toLowerCase() : '');
+
+          if (!isAlreadyPrepended(computedFont, isMono) && !isIconFont(selectorHint, computedFont)) {
             const prependStr = isMono ? MONO_PREPEND_STR : SANS_PREPEND_STR;
             el.style.setProperty('font-family', `${prependStr}${computedFont}`, 'important');
+
+            // 若父容器為標題且包含 a 標籤，同步確保 a 標籤不被其他預設樣式覆蓋
+            const childLink = el.querySelector ? el.querySelector('a') : null;
+            if (childLink && !processedElements.has(childLink)) {
+              processedElements.add(childLink);
+              childLink.style.setProperty('font-family', `${prependStr}${computedFont}`, 'important');
+            }
           }
         }
       } catch {
@@ -386,6 +464,7 @@
           try {
             injectBaseStyles(shadowRoot);
             scanAndPatchStyleSheets(shadowRoot);
+            scanAndPatchInlineStyles(shadowRoot);
             observeStyleSheets(shadowRoot);
           } catch {
             // 防禦性容錯
@@ -397,7 +476,7 @@
   }
 
   /**
-   * 監聽樣式表動態插入與載入事件
+   * 監聽樣式表動態插入與載入事件、行內樣式屬性變更
    * @param {Document|ShadowRoot} targetDoc 目標文件或根節點
    */
   function observeStyleSheets(targetDoc = document) {
@@ -407,32 +486,51 @@
     }
 
     const observer = new MutationObserver((mutations) => {
-      let shouldScan = false;
+      let shouldScanStylesheets = false;
+      let shouldScanInline = false;
+
       for (let i = 0; i < mutations.length; i++) {
         const mutation = mutations[i];
-        if (mutation.type === 'childList') {
+
+        // 1. 監聽行內 style 屬性動態變更
+        if (mutation.type === 'attributes' && mutation.attributeName === 'style') {
+          patchElementInlineStyle(mutation.target);
+        } else if (mutation.type === 'childList') {
           for (let j = 0; j < mutation.addedNodes.length; j++) {
             const node = mutation.addedNodes[j];
             if (node.nodeType !== 1) continue;
             const tagName = node.tagName.toLowerCase();
+
             if (tagName === 'style') {
-              shouldScan = true;
+              shouldScanStylesheets = true;
             } else if (tagName === 'link' && node.rel === 'stylesheet') {
               node.addEventListener('load', () => {
                 if (node.sheet) processStyleSheet(node.sheet);
               }, { once: true });
+            } else {
+              // 檢查新節點是否包含行內 style 元素
+              shouldScanInline = true;
             }
           }
         }
       }
-      if (shouldScan) {
+
+      if (shouldScanStylesheets) {
         scanAndPatchStyleSheets(targetDoc);
+      }
+      if (shouldScanInline) {
+        scanAndPatchInlineStyles(targetDoc);
+        if (hasCorsSheets) {
+          scheduleIdleComputedStylePatch();
+        }
       }
     });
 
     observer.observe(targetNode, {
       childList: true,
-      subtree: true
+      subtree: true,
+      attributes: true,
+      attributeFilter: ['style']
     });
   }
 
@@ -449,14 +547,28 @@
     // 3. 靜態同源 CSSOM 掃描
     scanAndPatchStyleSheets(document);
 
-    // 4. 監聽動態樣式注入
+    // 4. 掃描行內樣式 (解決 UNIKO's Hardware 等 CMS 文章行內樣式覆寫)
+    scanAndPatchInlineStyles(document);
+
+    // 5. 監聽動態樣式注入與行內樣式變更
     observeStyleSheets(document);
 
-    // 5. 若在 DOMContentLoaded 或 load 事件發生前載入，註冊生命週期鉤子再次掃描
+    // 6. 若在 DOMContentLoaded 或 load 事件發生前載入，註冊生命週期鉤子再次掃描
     if (document.readyState === 'loading') {
       document.addEventListener('DOMContentLoaded', () => {
         injectBaseStyles(document);
         scanAndPatchStyleSheets(document);
+        scanAndPatchInlineStyles(document);
+        if (hasCorsSheets) {
+          scheduleIdleComputedStylePatch();
+        }
+      }, { once: true });
+    }
+
+    // 7. window load 完成後若有 CORS 樣式表，執行一次 computed style patch
+    if (typeof window !== 'undefined') {
+      window.addEventListener('load', () => {
+        scanAndPatchInlineStyles(document);
         if (hasCorsSheets) {
           scheduleIdleComputedStylePatch();
         }
@@ -485,6 +597,8 @@
       processStyleSheet,
       processRules,
       scanAndPatchStyleSheets,
+      patchElementInlineStyle,
+      scanAndPatchInlineStyles,
       patchComputedStyles,
       scheduleIdleComputedStylePatch,
       hookShadowDOM,

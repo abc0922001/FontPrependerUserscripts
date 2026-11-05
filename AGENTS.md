@@ -98,7 +98,7 @@ npm run check
 ```bash
 npm run test
 ```
-* **驗收標準**：`tests/parser.test.js`、`tests/dom.test.js` 與 `tests/sites.test.js` 全部 40 項測試綠燈通過。
+* **驗收標準**：`tests/parser.test.js`、`tests/dom.test.js` 與 `tests/sites.test.js` 全部 42 項測試綠燈通過。
 
 ### 5.3 量化效能評估 (Performance Benchmark)
 ```bash
