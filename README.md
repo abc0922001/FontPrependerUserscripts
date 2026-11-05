@@ -1,5 +1,6 @@
 # Font Prepender - 自訂網頁與程式碼首選字型
 
+[![Direct Install](https://img.shields.io/badge/Direct_Install-FontPrepender.user.js-brightgreen.svg?style=flat&logo=tampermonkey)](https://github.com/abc0922001/FontPrependerUserscripts/raw/main/src/FontPrepender.user.js)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Greasy Fork](https://img.shields.io/badge/Greasy%20Fork-FontPrepender-red.svg)](https://greasyfork.org/zh-TW/users/1237813-abc0922001)
 
@@ -36,6 +37,11 @@
 
 ## 3. 安裝與相容性
 
+### 一鍵快速安裝
+若您的瀏覽器已安裝腳本管理器，可直接點擊下方按鈕觸發安裝：
+
+[![直接安裝腳本 (Direct Install)](https://img.shields.io/badge/直接安裝-FontPrepender.user.js-brightgreen?style=for-the-badge&logo=tampermonkey)](https://github.com/abc0922001/FontPrependerUserscripts/raw/main/src/FontPrepender.user.js)
+
 ### 支援的腳本管理器
 * [Tampermonkey（油猴）](https://www.tampermonkey.net/)（推薦）
 * [Violentmonkey（暴力猴）](https://violentmonkey.github.io/)
@@ -43,8 +49,8 @@
 
 ### 安裝步驟
 1. 安裝上述任一腳本管理器瀏覽器擴充功能。
-2. 前往 Greasy Fork 安裝頁面或直接在腳本管理器中匯入 `src/FontPrepender.user.js`。
-3. 點擊「安裝」即可自動生效。
+2. 點擊上方 [直接安裝按鈕](https://github.com/abc0922001/FontPrependerUserscripts/raw/main/src/FontPrepender.user.js) 或前往 Greasy Fork 安裝頁面。
+3. 腳本管理器將會自動彈出安裝確認視窗，點擊「安裝」即可生效。
 
 ---
 
