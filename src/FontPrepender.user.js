@@ -36,7 +36,7 @@
   'use strict';
 
   // --- 字型配置常數 ---
-  const SANS_FONTS = ['"Google Sans"', '"Noto Sans CJK TC"'];
+  const SANS_FONTS = ['"Google Sans"', '"Google Sans Flex"', '"Noto Sans CJK TC"'];
   const MONO_FONTS = ['"Intel One Mono"', '"Noto Sans Mono CJK TC"'];
 
   const SANS_PREPEND_STR = `${SANS_FONTS.join(', ')}, `;
