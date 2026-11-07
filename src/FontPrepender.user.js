@@ -393,6 +393,9 @@
 `;
       try {
         parent.appendChild(baseStyle);
+        if (baseStyle.sheet) {
+          processedStyleSheets.add(baseStyle.sheet);
+        }
       } catch {
         // 容錯防禦
       }
@@ -409,6 +412,9 @@
 `;
       try {
         parent.appendChild(editorStyle);
+        if (editorStyle.sheet) {
+          processedStyleSheets.add(editorStyle.sheet);
+        }
       } catch {
         // 容錯防禦
       }
@@ -485,9 +491,15 @@
       return;
     }
 
+    const owner = sheet.ownerNode;
+    // 自身樣式表防護：若為腳本自身注入的基礎樣式或編輯器樣式，直接加入已處理集合並跳過
+    if (owner && (owner.id === BASE_STYLE_ID || owner.id === EDITOR_STYLE_ID)) {
+      processedStyleSheets.add(sheet);
+      return;
+    }
+
     // 樣式表層級預篩：若為內嵌 <style> 標籤且內容完全不含字型關鍵字，O(1) 短路跳過 cssRules 走訪
     let hasFontVars = true;
-    const owner = sheet.ownerNode;
     if (owner && (owner.tagName === 'STYLE' || owner.tagName === 'style') && typeof owner.textContent === 'string') {
       const sheetText = owner.textContent;
       if (!/font|family|@import/i.test(sheetText)) {
@@ -1054,6 +1066,7 @@
       MONO_PREPEND_STR,
       BASE_SANS_STACK,
       BASE_MONO_STACK,
+      processedStyleSheets,
       isIconFont,
       isMonospace,
       isAlreadyPrepended,

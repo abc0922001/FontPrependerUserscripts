@@ -56,6 +56,11 @@ describe('DOM / CSSOM 與特例整合測試', () => {
     // 測試重複注入冪等性
     exports.injectBaseStyles(document);
     expect(document.querySelectorAll('#font-prepender-base-style').length).toBe(1);
+
+    // 驗證已將自身樣式表加入 processedStyleSheets 避免重複掃描
+    if (baseStyle.sheet) {
+      expect(exports.processedStyleSheets.has(baseStyle.sheet)).toBe(true);
+    }
   });
 
   it('2. 應正確掃描並就地改寫 CSSOM 規則中的 font-family', () => {
