@@ -781,6 +781,48 @@
   }
 
   /**
+   * 處理單一 ShadowRoot（注入基礎樣式、掃描既有樣式表與行內樣式，並掛載監聽器）
+   * @param {ShadowRoot} shadowRoot 目標 ShadowRoot 節點
+   */
+  function processShadowRoot(shadowRoot) {
+    if (!shadowRoot || processedShadowRoots.has(shadowRoot)) return;
+    processedShadowRoots.add(shadowRoot);
+    try {
+      injectBaseStyles(shadowRoot);
+      scanAndPatchStyleSheets(shadowRoot);
+      scanAndPatchInlineStyles(shadowRoot);
+      observeStyleSheets(shadowRoot);
+      scanAndPatchShadowRoots(shadowRoot);
+    } catch {
+      // 防禦性容錯
+    }
+  }
+
+  /**
+   * 穿透掃描目標節點或子樹內包含之 Declarative Shadow DOM 與既有 ShadowRoot
+   * @param {Document|Element|ShadowRoot} root 目標根節點
+   */
+  function scanAndPatchShadowRoots(root = document) {
+    if (!root) return;
+    if (root.shadowRoot) {
+      processShadowRoot(root.shadowRoot);
+    }
+    if (typeof root.querySelectorAll !== 'function') return;
+    try {
+      const hosts = root.querySelectorAll('*');
+      const len = hosts.length;
+      for (let i = 0; i < len; i++) {
+        const el = hosts[i];
+        if (el && el.shadowRoot) {
+          processShadowRoot(el.shadowRoot);
+        }
+      }
+    } catch {
+      // 容錯防禦
+    }
+  }
+
+  /**
    * 特例五：攔截 Element.prototype.attachShadow 支援 Web Components
    */
   function hookShadowDOM() {
@@ -792,17 +834,7 @@
     Element.prototype.attachShadow = function(initOptions) {
       const shadowRoot = originalAttachShadow.call(this, initOptions);
       if (shadowRoot && initOptions && initOptions.mode === 'open') {
-        if (!processedShadowRoots.has(shadowRoot)) {
-          processedShadowRoots.add(shadowRoot);
-          try {
-            injectBaseStyles(shadowRoot);
-            scanAndPatchStyleSheets(shadowRoot);
-            scanAndPatchInlineStyles(shadowRoot);
-            observeStyleSheets(shadowRoot);
-          } catch {
-            // 防禦性容錯
-          }
-        }
+        processShadowRoot(shadowRoot);
       }
       return shadowRoot;
     };
@@ -939,6 +971,10 @@
             if (!node || node.nodeType !== 1) continue;
             const tagName = node.tagName;
 
+            if (node.shadowRoot) {
+              processShadowRoot(node.shadowRoot);
+            }
+
             if (tagName === 'STYLE' || tagName === 'style') {
               if (node.sheet) {
                 processStyleSheet(node.sheet);
@@ -969,6 +1005,7 @@
               } else {
                 // 互動期（SPA 動態渲染）：增量掃描新增之局部子樹（葉節點 O(1) 短路，容器子樹 O(ΔN)）
                 scanAndPatchInlineStyles(node);
+                scanAndPatchShadowRoots(node);
                 if (node.firstElementChild && typeof node.querySelectorAll === 'function') {
                   const nestedStyles = node.querySelectorAll('style, link[rel="stylesheet"]');
                   const nestedLen = nestedStyles.length;
@@ -1023,9 +1060,10 @@
     // 4. 靜態同源 CSSOM 掃描
     scanAndPatchStyleSheets(document);
 
-    // 5. 掃描行內樣式 (若已進入 DOMContentLoaded 之後則立即執行，loading 期間留待 DOMContentLoaded 統一執行)
+    // 5. 掃描行內樣式與 Declarative Shadow DOM (若已進入 DOMContentLoaded 之後則立即執行，loading 期間留待 DOMContentLoaded 統一執行)
     if (document.readyState !== 'loading') {
       scanAndPatchInlineStyles(document);
+      scanAndPatchShadowRoots(document);
     }
 
     // 6. 監聽動態樣式注入與行內樣式變更
@@ -1037,6 +1075,7 @@
         injectBaseStyles(document);
         scanAndPatchStyleSheets(document);
         scanAndPatchInlineStyles(document);
+        scanAndPatchShadowRoots(document);
         if (hasCorsSheets) {
           scheduleIdleComputedStylePatch();
         }
@@ -1082,6 +1121,8 @@
       scheduleIdleComputedStylePatch,
       getHasCorsSheets: () => hasCorsSheets,
       hookShadowDOM,
+      processShadowRoot,
+      scanAndPatchShadowRoots,
       hookCSSPrototypes,
       observeStyleSheets,
       init

@@ -3,7 +3,7 @@ import { JSDOM } from 'jsdom';
 import fs from 'node:fs';
 import vm from 'node:vm';
 
-function createEnvironment(html = '<!DOCTYPE html><html><head></head><body></body></html>') {
+function createEnvironment(html = '<!DOCTYPE html><html><head></head><body></body></html>', beforeInit) {
   const dom = new JSDOM(html, {
     url: 'https://example.com/',
     runScripts: 'dangerously'
@@ -11,6 +11,10 @@ function createEnvironment(html = '<!DOCTYPE html><html><head></head><body></bod
 
   const { window } = dom;
   const { document, Element, MutationObserver, CSSStyleSheet, CSSStyleDeclaration } = window;
+
+  if (typeof beforeInit === 'function') {
+    beforeInit(window, document);
+  }
 
   const code = fs.readFileSync(new URL('../src/FontPrepender.user.js', import.meta.url), 'utf8');
   const module = { exports: {} };
@@ -172,6 +176,30 @@ describe('DOM / CSSOM 與特例整合測試', () => {
     const shadowBaseStyle = shadowRoot.querySelector('#font-prepender-base-style');
     expect(shadowBaseStyle).not.toBeNull();
     expect(shadowBaseStyle.textContent).toContain('Google Sans');
+  });
+
+  it('5.1 應穿透掃描既有與 Declarative Shadow DOM (scanAndPatchShadowRoots)', () => {
+    let capturedShadowRoot = null;
+    const { document, exports } = createEnvironment('<!DOCTYPE html><html><head></head><body></body></html>', (win, doc) => {
+      const customHost = doc.createElement('custom-card');
+      doc.body.appendChild(customHost);
+      capturedShadowRoot = customHost.attachShadow({ mode: 'open' });
+      const p = doc.createElement('p');
+      p.className = 'shadow-desc';
+      p.style.fontFamily = 'Arial, sans-serif';
+      p.textContent = 'Shadow Content';
+      capturedShadowRoot.appendChild(p);
+    });
+
+    // 呼叫穿透掃描
+    exports.scanAndPatchShadowRoots(document);
+
+    const baseStyle = capturedShadowRoot.querySelector('#font-prepender-base-style');
+    expect(baseStyle).not.toBeNull();
+    expect(baseStyle.textContent).toContain('Google Sans');
+
+    const p = capturedShadowRoot.querySelector('.shadow-desc');
+    expect(p.style.getPropertyValue('font-family')).toContain('Google Sans');
   });
 
   it('6. 應支援 adoptedStyleSheets 樣式表改寫', () => {
