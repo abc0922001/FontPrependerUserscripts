@@ -292,6 +292,34 @@
   }
 
   /**
+   * 從 CSS 原始字串之指定偏移位置逆向提取當前規則區塊的選擇器文字
+   * @param {string} cssText 完整 CSS 文字
+   * @param {number} offset 匹配屬性所在偏移量
+   * @returns {string} 提取出的選擇器字串（若無則回傳空字串）
+   */
+  function extractSelectorBefore(cssText, offset) {
+    if (!cssText || typeof offset !== 'number' || offset <= 0) return '';
+    const openBraceIdx = cssText.lastIndexOf('{', offset);
+    if (openBraceIdx === -1) return '';
+
+    let startIdx = openBraceIdx - 1;
+    while (startIdx >= 0) {
+      const ch = cssText.charCodeAt(startIdx);
+      // 遇到前一個規則結尾 '}' (125)、外層 '@media {' 的 '{' (123) 或 ';' (59) 時停止
+      if (ch === 125 || ch === 123 || ch === 59) {
+        break;
+      }
+      startIdx--;
+    }
+
+    const rawSelector = cssText.slice(startIdx + 1, openBraceIdx).trim();
+    if (!rawSelector || rawSelector.charCodeAt(0) === 64) {
+      return '';
+    }
+    return rawSelector;
+  }
+
+  /**
    * 改寫文字版 CSS 內容（用於跨域樣式表重新載入注入或 replaceSync）
    * @param {string} cssText 原始 CSS 文字
    * @param {string} [baseUrl=''] 基礎路徑（修復相對 url 資源）
@@ -319,9 +347,10 @@
 
     // 替換 font-family 宣告（若無關鍵字則 O(1) 短路跳過正則掃描）
     if (result.includes('font-family')) {
-      result = result.replace(/font-family\s*:\s*([^;!}]+)(!important)?/gi, (match, fontVal, important) => {
+      result = result.replace(/font-family\s*:\s*([^;!}]+)(!important)?/gi, (match, fontVal, important, offset, fullStr) => {
         if (!fontVal) return match;
-        const prepended = prependFontFamily(fontVal);
+        const selector = extractSelectorBefore(fullStr, offset);
+        const prepended = prependFontFamily(fontVal, selector);
         if (!prepended || prepended === fontVal) return match;
         return `font-family: ${prepended}${important ? ' !important' : ''}`;
       });

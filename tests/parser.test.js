@@ -17,6 +17,7 @@ function loadUserscript(sandbox = {}) {
 
 const {
   prependFontFamily,
+  rewriteCssContent,
   isIconFont,
   isMonospace,
   isAlreadyPrepended,
@@ -159,6 +160,18 @@ describe('字型堆疊解析與前置引擎 (Font Stack Parser & Prepender)', ()
 
       const monoVar = 'var(--font-mono)';
       expect(prependFontFamily(monoVar)).toBe(`${MONO_PREPEND_STR}${monoVar}`);
+    });
+
+    it('rewriteCssContent 應逆向提取選擇器上下文，保護圖示選擇器並將 pre/code 識別為等寬', () => {
+      const css = `
+        .fa-icon { font-family: sans-serif; }
+        pre.code-block { font-family: sans-serif !important; }
+        @media (min-width: 768px) { .article-body { font-family: Arial, sans-serif; } }
+      `;
+      const rewritten = rewriteCssContent(css);
+      expect(rewritten).toContain('.fa-icon { font-family: sans-serif; }');
+      expect(rewritten).toContain(`pre.code-block { font-family: ${MONO_PREPEND_STR}sans-serif !important; }`);
+      expect(rewritten).toContain(`.article-body { font-family: ${SANS_PREPEND_STR}Arial, sans-serif; }`);
     });
   });
 });
