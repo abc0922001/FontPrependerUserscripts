@@ -10,7 +10,7 @@ function createEnvironment(html = '<!DOCTYPE html><html><head></head><body></bod
   });
 
   const { window } = dom;
-  const { document, Element, MutationObserver, CSSStyleSheet, CSSStyleDeclaration } = window;
+  const { document, Element, HTMLElement, MutationObserver, CSSStyleSheet, CSSStyleDeclaration } = window;
 
   if (typeof beforeInit === 'function') {
     beforeInit(window, document);
@@ -23,6 +23,7 @@ function createEnvironment(html = '<!DOCTYPE html><html><head></head><body></bod
     window,
     document,
     Element,
+    HTMLElement,
     MutationObserver,
     CSSStyleSheet,
     CSSStyleDeclaration,
@@ -245,5 +246,21 @@ describe('DOM / CSSOM 與特例整合測試', () => {
 
     expect(capturedText).toContain(`font-family: ${exports.SANS_PREPEND_STR}Arial, sans-serif`);
     expect(capturedText).toContain(`font-family: ${exports.MONO_PREPEND_STR}sans-serif`);
+  });
+
+  it('8. 原型鏈 setProperty 與 fontFamily setter 應能感知關聯元素之標籤與圖示上下文', () => {
+    const { document, exports } = createEnvironment();
+    exports.hookCSSPrototypes();
+
+    const codeEl = document.createElement('code');
+    document.body.appendChild(codeEl);
+    codeEl.style.fontFamily = 'var(--user-custom)';
+    expect(codeEl.style.getPropertyValue('font-family')).toContain('Intel One Mono');
+
+    const iconEl = document.createElement('i');
+    iconEl.className = 'fas';
+    document.body.appendChild(iconEl);
+    iconEl.style.setProperty('font-family', 'sans-serif');
+    expect(iconEl.style.getPropertyValue('font-family')).toBe('sans-serif');
   });
 });

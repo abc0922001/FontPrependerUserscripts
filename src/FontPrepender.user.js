@@ -92,6 +92,7 @@
   const processedStyleSheets = new WeakSet();
   const processedShadowRoots = new WeakSet();
   const processedElements = new WeakSet();
+  const styleToElementMap = new WeakMap();
   const fetchedStyleSheetUrls = new Set();
 
   // LRU / FIFO 快取結構（O(1) 查詢，上限 1000 筆防止記憶體洩漏）
@@ -591,12 +592,52 @@
   }
 
   /**
+   * 取得 DOM 元素的選擇器提示字串（若命中圖示或等寬特徵則組裝提示，否則回傳空字串）
+   * @param {Element|HTMLElement} el 目標 DOM 元素
+   * @returns {string} 選擇器提示字串
+   */
+  function getElementSelectorHint(el) {
+    if (!el) return '';
+    const idStr = el.id || '';
+    const classStr = el.className && typeof el.className === 'string' ? el.className : '';
+    const tagStr = el.tagName || '';
+
+    if (
+      (idStr && SELECTOR_HINT_REGEX.test(idStr)) ||
+      (classStr && SELECTOR_HINT_REGEX.test(classStr)) ||
+      (tagStr && MONO_TAG_REGEX.test(tagStr))
+    ) {
+      return (idStr ? `#${idStr}` : '') + (classStr ? `.${classStr.trim().replace(/\s+/g, '.')}` : '') || tagStr.toLowerCase();
+    }
+    return '';
+  }
+
+  /**
+   * 取得 CSSStyleDeclaration 物件對應的選擇器上下文（關聯之 DOM 元素或父 CSS 規則）
+   * @param {CSSStyleDeclaration} styleDecl 目標樣式宣告物件
+   * @returns {string} 選擇器上下文
+   */
+  function getStyleContextSelector(styleDecl) {
+    if (!styleDecl) return '';
+    const ownerEl = styleToElementMap.get(styleDecl);
+    if (ownerEl) {
+      return getElementSelectorHint(ownerEl);
+    }
+    if (styleDecl.parentRule && styleDecl.parentRule.selectorText) {
+      return styleDecl.parentRule.selectorText;
+    }
+    return '';
+  }
+
+  /**
    * 處理單一 DOM 元素的行內樣式 font-family（支援 !important 優先級保留）
    * 解決 UNIKO's Hardware 等 CMS 文章標題與連結直接嵌入 style="font-family: ... !important;" 的問題
    * @param {HTMLElement} el 目標 DOM 元素
    */
   function patchElementInlineStyle(el) {
     if (!el || !el.style || typeof el.style.getPropertyValue !== 'function') return;
+
+    styleToElementMap.set(el.style, el);
 
     const inlineFont = el.style.getPropertyValue('font-family');
     if (!inlineFont || CSS_SYSTEM_KEYWORDS_REGEX.test(inlineFont.trim())) {
@@ -608,20 +649,7 @@
       return;
     }
 
-    // 僅在元素 id / className / tagName 命中特殊圖示或等寬特徵時才建構選擇器提示，常規元素維持零字串配置
-    const idStr = el.id || '';
-    const classStr = el.className && typeof el.className === 'string' ? el.className : '';
-    const tagStr = el.tagName || '';
-    let selectorHint = '';
-
-    if (
-      (idStr && SELECTOR_HINT_REGEX.test(idStr)) ||
-      (classStr && SELECTOR_HINT_REGEX.test(classStr)) ||
-      (tagStr && MONO_TAG_REGEX.test(tagStr))
-    ) {
-      selectorHint = (idStr ? `#${idStr}` : '') + (classStr ? `.${classStr.trim().replace(/\s+/g, '.')}` : '') || tagStr.toLowerCase();
-    }
-
+    const selectorHint = getElementSelectorHint(el);
     const newFont = prependFontFamily(inlineFont, selectorHint);
     if (newFont !== inlineFont) {
       const priority = el.style.getPropertyPriority('font-family');
@@ -845,13 +873,40 @@
    * 確保 CSS-in-JS 與動態腳本產生的字型樣式第一時間被前置
    */
   function hookCSSPrototypes() {
+    // 0. 攔截 HTMLElement.prototype.style getter 以建立 style 物件與 DOM 元素的弱引用關聯
+    try {
+      const proto = (typeof HTMLElement !== 'undefined' && HTMLElement.prototype) ||
+                    (typeof window !== 'undefined' && window.HTMLElement && window.HTMLElement.prototype) ||
+                    (typeof Element !== 'undefined' && Element.prototype);
+      if (proto) {
+        const desc = Object.getOwnPropertyDescriptor(proto, 'style');
+        if (desc && desc.get) {
+          const origStyleGet = desc.get;
+          Object.defineProperty(proto, 'style', {
+            get: function() {
+              const s = origStyleGet.call(this);
+              if (s && typeof s === 'object') {
+                styleToElementMap.set(s, this);
+              }
+              return s;
+            },
+            configurable: true,
+            enumerable: true
+          });
+        }
+      }
+    } catch {
+      // 容錯防禦
+    }
+
     // 1. 攔截 CSSStyleDeclaration.prototype.setProperty
     try {
       if (typeof CSSStyleDeclaration !== 'undefined' && CSSStyleDeclaration.prototype.setProperty) {
         const origSetProperty = CSSStyleDeclaration.prototype.setProperty;
         CSSStyleDeclaration.prototype.setProperty = function(prop, val, priority) {
           if (!isInternalStyleWrite && prop === 'font-family' && typeof val === 'string' && val) {
-            const prepended = prependFontFamily(val);
+            const selectorContext = getStyleContextSelector(this);
+            const prepended = prependFontFamily(val, selectorContext);
             if (prepended) val = prepended;
           }
           return origSetProperty.call(this, prop, val, priority);
@@ -863,15 +918,31 @@
 
     // 2. 攔截 CSSStyleDeclaration.prototype.fontFamily setter
     try {
-      if (typeof CSSStyleDeclaration !== 'undefined') {
-        const desc = Object.getOwnPropertyDescriptor(CSSStyleDeclaration.prototype, 'fontFamily');
+      let styleProto = typeof CSSStyleDeclaration !== 'undefined' ? CSSStyleDeclaration.prototype : null;
+      if (typeof document !== 'undefined' && document.createElement) {
+        const dummy = document.createElement('div');
+        if (dummy.style) {
+          let curr = Object.getPrototypeOf(dummy.style);
+          while (curr && curr !== Object.prototype) {
+            if (Object.getOwnPropertyDescriptor(curr, 'fontFamily')) {
+              styleProto = curr;
+              break;
+            }
+            curr = Object.getPrototypeOf(curr);
+          }
+        }
+      }
+
+      if (styleProto) {
+        const desc = Object.getOwnPropertyDescriptor(styleProto, 'fontFamily');
         if (desc && desc.set) {
           const origSet = desc.set;
-          Object.defineProperty(CSSStyleDeclaration.prototype, 'fontFamily', {
+          Object.defineProperty(styleProto, 'fontFamily', {
             get: desc.get,
             set: function(val) {
               if (!isInternalStyleWrite && typeof val === 'string' && val) {
-                const prepended = prependFontFamily(val);
+                const selectorContext = getStyleContextSelector(this);
+                const prepended = prependFontFamily(val, selectorContext);
                 if (prepended) val = prepended;
               }
               return origSet.call(this, val);
