@@ -101,8 +101,15 @@ describe('DOM / CSSOM 與特例整合測試', () => {
     expect(innerRule.style.getPropertyValue('font-family')).toContain('Google Sans');
   });
 
-  it('4. 跨域樣式表 (CORS) 存取拋出 SecurityError 時應安全捕捉並不崩潰', () => {
-    const { exports } = createEnvironment();
+  it('4. 跨域樣式表 (CORS) 存取拋出 SecurityError 時應安全捕捉並不崩潰，且以 hasCorsSheets 閘門控制排程', () => {
+    const { exports, window } = createEnvironment();
+
+    expect(exports.getHasCorsSheets()).toBe(false);
+
+    // 在無跨域樣式表下呼叫 scheduleIdleComputedStylePatch 應被閘門短路攔截
+    window.requestIdleCallback = vi.fn();
+    exports.scheduleIdleComputedStylePatch();
+    expect(window.requestIdleCallback).not.toHaveBeenCalled();
 
     const mockCorsSheet = {
       get cssRules() {
@@ -113,6 +120,8 @@ describe('DOM / CSSOM 與特例整合測試', () => {
     expect(() => {
       exports.processStyleSheet(mockCorsSheet);
     }).not.toThrow();
+
+    expect(exports.getHasCorsSheets()).toBe(true);
   });
 
   it('5. 應攔截 Element.prototype.attachShadow 並為 open 模式 ShadowRoot 掛載基礎樣式', () => {

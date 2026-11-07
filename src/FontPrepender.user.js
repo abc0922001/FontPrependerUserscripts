@@ -486,7 +486,6 @@
       rules = sheet.cssRules;
     } catch {
       // 特例二：跨域樣式表存取拋出 SecurityError
-      hasCorsSheets = true;
       processedStyleSheets.add(sheet);
 
       // 若為外部 link 樣式表且支援 fetch，嘗試直接下載改寫注入（解決 XDA 等 CDN 外部樣式表）
@@ -495,7 +494,14 @@
       if (typeof fetch === 'function' && href && !fetchedStyleSheetUrls.has(href)) {
         fetchedStyleSheetUrls.add(href);
         fetch(href)
-          .then((res) => (res.ok ? res.text() : null))
+          .then((res) => {
+            if (!res || !res.ok) {
+              hasCorsSheets = true;
+              scheduleIdleComputedStylePatch();
+              return null;
+            }
+            return res.text();
+          })
           .then((cssText) => {
             if (!cssText || !cssText.includes('font-family')) return;
             const rewritten = rewriteCssContent(cssText, href);
@@ -518,9 +524,11 @@
           })
           .catch(() => {
             // fetch 失敗時退避至空閒計算樣式修補
+            hasCorsSheets = true;
             scheduleIdleComputedStylePatch();
           });
       } else {
+        hasCorsSheets = true;
         scheduleIdleComputedStylePatch();
       }
       return;
@@ -725,10 +733,10 @@
   }
 
   /**
-   * 排程空閒時間執行計算樣式修補
+   * 排程空閒時間執行計算樣式修補（僅在存在無法同源改寫之跨域樣式表時啟動）
    */
   function scheduleIdleComputedStylePatch() {
-    if (isIdlePatchScheduled || typeof window === 'undefined') return;
+    if (!hasCorsSheets || isIdlePatchScheduled || typeof window === 'undefined') return;
     isIdlePatchScheduled = true;
 
     const runner = () => {
@@ -987,15 +995,19 @@
         injectBaseStyles(document);
         scanAndPatchStyleSheets(document);
         scanAndPatchInlineStyles(document);
-        scheduleIdleComputedStylePatch();
+        if (hasCorsSheets) {
+          scheduleIdleComputedStylePatch();
+        }
       }, { once: true });
     }
 
-    // 8. window load 完成後執行一次 computed style patch，確保動態組件與後設資料完整前置
+    // 8. window load 完成後若存在跨域樣式表，執行一次 computed style patch
     if (typeof window !== 'undefined') {
       window.addEventListener('load', () => {
         scanAndPatchInlineStyles(document);
-        scheduleIdleComputedStylePatch();
+        if (hasCorsSheets) {
+          scheduleIdleComputedStylePatch();
+        }
       }, { once: true });
     }
   }
@@ -1026,6 +1038,7 @@
       scanAndPatchInlineStyles,
       patchComputedStyles,
       scheduleIdleComputedStylePatch,
+      getHasCorsSheets: () => hasCorsSheets,
       hookShadowDOM,
       hookCSSPrototypes,
       observeStyleSheets,
