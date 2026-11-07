@@ -892,8 +892,18 @@
               scanAndPatchInlineStyles(node);
               if (node.firstElementChild && typeof node.querySelectorAll === 'function') {
                 const nestedStyles = node.querySelectorAll('style, link[rel="stylesheet"]');
-                if (nestedStyles.length > 0) {
-                  shouldScanStylesheets = true;
+                const nestedLen = nestedStyles.length;
+                for (let k = 0; k < nestedLen; k++) {
+                  const styleNode = nestedStyles[k];
+                  if (styleNode.sheet) {
+                    processStyleSheet(styleNode.sheet);
+                  } else if ((styleNode.tagName === 'LINK' || styleNode.tagName === 'link') && typeof styleNode.addEventListener === 'function') {
+                    styleNode.addEventListener('load', () => {
+                      if (styleNode.sheet) processStyleSheet(styleNode.sheet);
+                    }, { once: true });
+                  } else {
+                    shouldScanStylesheets = true;
+                  }
                 }
               }
             }
