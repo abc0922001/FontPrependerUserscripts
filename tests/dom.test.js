@@ -10,7 +10,7 @@ function createEnvironment(html = '<!DOCTYPE html><html><head></head><body></bod
   });
 
   const { window } = dom;
-  const { document, Element, MutationObserver } = window;
+  const { document, Element, MutationObserver, CSSStyleSheet, CSSStyleDeclaration } = window;
 
   const code = fs.readFileSync(new URL('../src/FontPrepender.user.js', import.meta.url), 'utf8');
   const module = { exports: {} };
@@ -20,6 +20,8 @@ function createEnvironment(html = '<!DOCTYPE html><html><head></head><body></bod
     document,
     Element,
     MutationObserver,
+    CSSStyleSheet,
+    CSSStyleDeclaration,
     setTimeout,
     clearTimeout,
     console,
@@ -154,5 +156,22 @@ describe('DOM / CSSOM 與特例整合測試', () => {
       expect.stringContaining('Google Sans'),
       ''
     );
+  });
+
+  it('7. 應攔截 CSSStyleSheet.prototype.replace 非同步方法並改寫字型宣告', async () => {
+    const { window, exports } = createEnvironment();
+    let capturedText = '';
+    window.CSSStyleSheet.prototype.replace = function(text) {
+      capturedText = text;
+      return Promise.resolve(this);
+    };
+
+    exports.hookCSSPrototypes();
+
+    const sheet = Object.create(window.CSSStyleSheet.prototype);
+    await sheet.replace('.async-card { font-family: Arial, sans-serif; } pre.code { font-family: sans-serif; }');
+
+    expect(capturedText).toContain(`font-family: ${exports.SANS_PREPEND_STR}Arial, sans-serif`);
+    expect(capturedText).toContain(`font-family: ${exports.MONO_PREPEND_STR}sans-serif`);
   });
 });

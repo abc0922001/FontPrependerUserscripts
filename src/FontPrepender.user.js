@@ -849,6 +849,25 @@
     } catch {
       // 容錯防禦
     }
+
+    // 5. 攔截 CSSStyleSheet.prototype.replace (非同步 Constructable Stylesheet)
+    try {
+      if (typeof CSSStyleSheet !== 'undefined' && CSSStyleSheet.prototype.replace) {
+        const origReplace = CSSStyleSheet.prototype.replace;
+        CSSStyleSheet.prototype.replace = function(text) {
+          if (typeof text === 'string' && text.includes('font-family')) {
+            try {
+              text = rewriteCssContent(text);
+            } catch {
+              // 容錯防禦
+            }
+          }
+          return origReplace.call(this, text);
+        };
+      }
+    } catch {
+      // 容錯防禦
+    }
   }
 
   /**
