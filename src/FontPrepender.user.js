@@ -468,6 +468,11 @@
       if (rule.cssRules) {
         processRules(rule.cssRules, hasFontVars);
       }
+
+      // @import 匯入之子樣式表 (CSSImportRule)
+      if (rule.styleSheet) {
+        processStyleSheet(rule.styleSheet);
+      }
     }
   }
 

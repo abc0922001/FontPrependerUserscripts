@@ -101,6 +101,36 @@ describe('DOM / CSSOM 與特例整合測試', () => {
     expect(innerRule.style.getPropertyValue('font-family')).toContain('Google Sans');
   });
 
+  it('3.1 應遞迴處理 @import 匯入之子樣式表 (CSSImportRule)', () => {
+    const { exports } = createEnvironment();
+
+    let childFont = 'sans-serif';
+    const mockChildSheet = {
+      cssRules: [
+        {
+          selectorText: '.imported-title',
+          style: {
+            getPropertyValue: (prop) => (prop === 'font-family' ? childFont : ''),
+            getPropertyPriority: () => '',
+            setProperty: (prop, val) => {
+              if (prop === 'font-family') childFont = val;
+            },
+            length: 0
+          }
+        }
+      ]
+    };
+
+    const mockParentRules = [
+      {
+        styleSheet: mockChildSheet
+      }
+    ];
+
+    exports.processRules(mockParentRules);
+    expect(childFont).toContain('Google Sans');
+  });
+
   it('4. 跨域樣式表 (CORS) 存取拋出 SecurityError 時應安全捕捉並不崩潰，且以 hasCorsSheets 閘門控制排程', () => {
     const { exports, window } = createEnvironment();
 
