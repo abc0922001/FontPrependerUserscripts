@@ -112,12 +112,30 @@ describe('字型堆疊解析與前置引擎 (Font Stack Parser & Prepender)', ()
       const input = '"Font Awesome 6 Free", "FontAwesome"';
       expect(prependFontFamily(input)).toBe(input);
       expect(prependFontFamily('sans-serif', '.fa-icon')).toBe('sans-serif');
+      expect(prependFontFamily('sans-serif', 'i.fa')).toBe('sans-serif');
+      expect(prependFontFamily('sans-serif', '.fas')).toBe('sans-serif');
+      expect(prependFontFamily('sans-serif', '.far')).toBe('sans-serif');
+      expect(prependFontFamily('sans-serif', '.fab')).toBe('sans-serif');
+      expect(prependFontFamily('sans-serif', '.fal')).toBe('sans-serif');
+    });
+
+    it('不應誤將含有 fa 開頭之常規英文單字判定為圖示', () => {
+      expect(prependFontFamily('sans-serif', '.fade')).toContain('Google Sans');
+      expect(prependFontFamily('sans-serif', '.family-text')).toContain('Google Sans');
+      expect(prependFontFamily('sans-serif', '.fast-loading')).toContain('Google Sans');
     });
 
     it('命中 Material Icons、Codicon、IcoMoon 等圖示庫字型應原樣保留', () => {
       const iconStacks = [
         'Material Icons',
         'Material Symbols Outlined',
+        'mat-icon',
+        'gem-icon',
+        'lucide',
+        'remixicon',
+        'tabler',
+        'devicon',
+        'lumi',
         'codicon',
         'feather',
         'icomoon',
@@ -134,6 +152,8 @@ describe('字型堆疊解析與前置引擎 (Font Stack Parser & Prepender)', ()
     it('isIconFont 能正確辨識圖示特徵選擇器與字型名稱', () => {
       expect(isIconFont('.btn-icon', 'sans-serif')).toBe(true);
       expect(isIconFont('', 'Material-Icons')).toBe(true);
+      expect(isIconFont('.ri-search-line', 'sans-serif')).toBe(true);
+      expect(isIconFont('.ti-arrow-right', 'sans-serif')).toBe(true);
       expect(isIconFont('.normal-text', 'Arial, sans-serif')).toBe(false);
     });
   });

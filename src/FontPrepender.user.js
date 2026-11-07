@@ -58,7 +58,7 @@
   const MONO_FONT_REGEX = /\b(?:monospace|ui-monospace|consolas|monaco|menlo|courier|fira\s*code|jetbrains\s*mono|source\s*code\s*pro|sfmono-regular|cascadia|inconsolata|ubuntu\s*mono|roboto\s*mono)\b/i;
 
   // 排除圖示與特殊字型特徵
-  const ICON_PATTERN_REGEX = /icon|fa-|fontawesome|material-icons|material-symbols|glyph|symbol|codicon|feather|icomoon|dashicons|octicons|fontello|ionicons|typicons|entypo|flowplayer/i;
+  const ICON_PATTERN_REGEX = /icon|fa-|fontawesome|(?:^|[\s.#,>+~[:])fa[srbltd]?(?=$|[\s.#,>+~[:\]])|material-icons|material-symbols|mat-icon|gem-icon|lucide|remixicon|ri-|tabler|ti-|devicon|lumi|glyph|symbol|codicon|feather|icomoon|dashicons|octicons|fontello|ionicons|typicons|entypo|flowplayer/i;
 
   // 具體標準正文與中文字型特徵（排除純 generic-family 關鍵字如 sans-serif/serif）
   const SPECIFIC_TEXT_FONT_REGEX = /(?:apple\s*lihei|microsoft\s*jhenghei|noto\s*sans|pingfang|heiti|system-ui|-apple-system|blinkmacsystemfont|roboto|arial|helvetica|segoe\s*ui|ubuntu|cantarell|meiryo)/i;
@@ -69,8 +69,8 @@
   // CSS 字型自訂變數特徵
   const CSS_VAR_FONT_REGEX = /^--.*(?:font|family)/i;
 
-  // 選擇器快速特徵篩選正則（合併圖示與等寬選擇器特徵，用於 O(1) 快取鍵狀態正規化）
-  const SELECTOR_HINT_REGEX = /(?:icon|fa-|fontawesome|material-icons|material-symbols|glyph|symbol|codicon|feather|icomoon|dashicons|octicons|fontello|ionicons|typicons|entypo|flowplayer|(?:^|[,\s>+~])(?:code|pre|kbd|samp|tt|var|\.monospace|\.code|\.highlight|\.blob-code)(?:$|[,\s.#:[]))/i;
+  // 選擇器快速特徵篩選正則（自動合併圖示與等寬選擇器特徵，用於 O(1) 快取鍵狀態正規化）
+  const SELECTOR_HINT_REGEX = new RegExp(`(?:${ICON_PATTERN_REGEX.source}|${MONO_SELECTOR_REGEX.source})`, 'i');
 
   // 等寬語意標籤名稱正則（用於 DOM 元素 tagName O(1) 快速判定）
   const MONO_TAG_REGEX = /^(?:code|pre|kbd|samp|tt|var)$/i;
