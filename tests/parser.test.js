@@ -173,5 +173,23 @@ describe('字型堆疊解析與前置引擎 (Font Stack Parser & Prepender)', ()
       expect(rewritten).toContain(`pre.code-block { font-family: ${MONO_PREPEND_STR}sans-serif !important; }`);
       expect(rewritten).toContain(`.article-body { font-family: ${SANS_PREPEND_STR}Arial, sans-serif; }`);
     });
+
+    it('rewriteCssContent 遇到 @font-face 規則應保持字型名稱定義不被改寫', () => {
+      const fontFaceCss = `
+        @font-face {
+          font-family: 'CustomFont';
+          src: url('custom.woff2') format('woff2');
+        }
+        @font-face {
+          font-family: "My Icon Font";
+          src: url('icons.woff') format('woff');
+        }
+        body { font-family: 'CustomFont', sans-serif; }
+      `;
+      const rewritten = rewriteCssContent(fontFaceCss);
+      expect(rewritten).toContain("font-family: 'CustomFont';");
+      expect(rewritten).toContain('font-family: "My Icon Font";');
+      expect(rewritten).toContain(`font-family: ${SANS_PREPEND_STR}'CustomFont', sans-serif;`);
+    });
   });
 });

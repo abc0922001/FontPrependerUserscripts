@@ -295,7 +295,7 @@
    * 從 CSS 原始字串之指定偏移位置逆向提取當前規則區塊的選擇器文字
    * @param {string} cssText 完整 CSS 文字
    * @param {number} offset 匹配屬性所在偏移量
-   * @returns {string} 提取出的選擇器字串（若無則回傳空字串）
+   * @returns {string|null} 提取出的選擇器字串（若是 @font-face 等字型定義規則則回傳 null，若無則回傳空字串）
    */
   function extractSelectorBefore(cssText, offset) {
     if (!cssText || typeof offset !== 'number' || offset <= 0) return '';
@@ -313,7 +313,12 @@
     }
 
     const rawSelector = cssText.slice(startIdx + 1, openBraceIdx).trim();
-    if (!rawSelector || rawSelector.charCodeAt(0) === 64) {
+    if (!rawSelector) return '';
+    if (rawSelector.charCodeAt(0) === 64) {
+      // 若為 @font-face、@font-palette-values 等字型註冊或自訂描述符，返回 null 哨兵值跳過改寫
+      if (/^@font-(?:face|palette-values|feature-values)\b/i.test(rawSelector)) {
+        return null;
+      }
       return '';
     }
     return rawSelector;
@@ -350,6 +355,7 @@
       result = result.replace(/font-family\s*:\s*([^;!}]+)(!important)?/gi, (match, fontVal, important, offset, fullStr) => {
         if (!fontVal) return match;
         const selector = extractSelectorBefore(fullStr, offset);
+        if (selector === null) return match;
         const prepended = prependFontFamily(fontVal, selector);
         if (!prepended || prepended === fontVal) return match;
         return `font-family: ${prepended}${important ? ' !important' : ''}`;
