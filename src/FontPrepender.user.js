@@ -61,6 +61,9 @@
   // 排除圖示與特殊字型特徵
   const ICON_PATTERN_REGEX = /icon|fa-|fontawesome|(?:^|[\s.#,>+~[:])fa[srbltd]?(?=$|[\s.#,>+~[:\]])|material-icons|material-symbols|mat-icon|gem-icon|lucide|remixicon|ri-|tabler|ti-|devicon|lumi|glyph|symbol|codicon|feather|icomoon|dashicons|octicons|fontello|ionicons|typicons|entypo|flowplayer/i;
 
+  // 字型家族字串專用圖示特徵正則（不含選擇器組合子與正向前瞻，大幅加速字型名稱冷解析）
+  const ICON_FONT_FAMILY_REGEX = /icon|fa-|fontawesome|\bfa[srbltd]?\b|material-icons|material-symbols|mat-icon|gem-icon|lucide|remixicon|ri-|tabler|ti-|devicon|lumi|glyph|symbol|codicon|feather|icomoon|dashicons|octicons|fontello|ionicons|typicons|entypo|flowplayer/i;
+
   // 具體標準正文與中文字型特徵（排除純 generic-family 關鍵字如 sans-serif/serif）
   const SPECIFIC_TEXT_FONT_REGEX = /(?:apple\s*lihei|microsoft\s*jhenghei|noto\s*sans|pingfang|heiti|system-ui|-apple-system|blinkmacsystemfont|roboto|arial|helvetica|segoe\s*ui|ubuntu|cantarell|meiryo)/i;
 
@@ -99,10 +102,26 @@
   // LRU / FIFO 快取結構（O(1) 查詢，上限 1000 筆防止記憶體洩漏）
   const MAX_CACHE_SIZE = 1000;
   const fontCache = new Map();
+  const neutralFontCache = new Map();
+  let selectorStateCache = new Map();
+
+  // 選擇器狀態對應之快取前綴常數（避免熱路徑模板字串重複拼接）
+  const SELECTOR_STATE_PREFIX = ['', '1|', '2|', '3|'];
 
   // 冪等性快速前綴判定正則（O(1) 時間，零字串拷貝與配置開銷）
   const ALREADY_SANS_REGEX = /^\s*['"]?\s*(?:google sans|noto sans cjk tc)/i;
   const ALREADY_MONO_REGEX = /^\s*['"]?\s*(?:intel one mono|noto sans mono cjk tc)/i;
+
+  // CSS 保留系統關鍵字 O(1) 查詢集合（免除每次呼叫正規表示式引擎）
+  const CSS_SYSTEM_KEYWORDS_SET = new Set([
+    'inherit', 'initial', 'unset', 'revert', 'revert-layer',
+    'INHERIT', 'INITIAL', 'UNSET', 'REVERT', 'REVERT-LAYER'
+  ]);
+
+  // 單一最近查詢快取（One-Element Memoization，加速連續相同呼叫）
+  let lastRawFont = '';
+  let lastRawSelector = '';
+  let lastPrependedResult = '';
 
   // 是否存在跨域樣式表標記
   let hasCorsSheets = false;
@@ -110,6 +129,43 @@
 
   // 內部樣式寫入重入防護標記（避免內部 setProperty 觸發原型鏈攔截器二次解析）
   let isInternalStyleWrite = false;
+
+  /**
+   * 寫入字型快取（達上限時採用批次清空策略，將攤銷維護開銷降至 O(1) 且免除每次 Map.keys() 迭代器配置）
+   * @param {Map<string, string>} targetMap 目標快取結構
+   * @param {string} key 快取鍵
+   * @param {string} val 快取值
+   */
+  function setCacheEntry(targetMap, key, val) {
+    if (targetMap.size >= MAX_CACHE_SIZE) {
+      targetMap.clear();
+    }
+    targetMap.set(key, val);
+  }
+
+  /**
+   * 取得選擇器語意狀態碼（0: 中性, 1: 等寬, 2: 全圖示, 3: 圖示且等寬）
+   * 結合 O(1) 快取避免對重複出現之選擇器反覆執行複合正規表示式掃描
+   * @param {string} selector 選擇器字串
+   * @returns {number} 語意狀態碼 (0 | 1 | 2 | 3)
+   */
+  function getSelectorState(selector) {
+    if (!selector) return 0;
+    let state = selectorStateCache.get(selector);
+    if (state !== undefined) return state;
+
+    state = 0;
+    if (SELECTOR_HINT_REGEX.test(selector)) {
+      const selIcon = isAllSelectorPartsIcon(selector);
+      const selMono = MONO_SELECTOR_REGEX.test(selector);
+      state = selIcon ? (selMono ? 3 : 2) : selMono ? 1 : 0;
+    }
+    if (selectorStateCache.size >= MAX_CACHE_SIZE) {
+      selectorStateCache.clear();
+    }
+    selectorStateCache.set(selector, state);
+    return state;
+  }
 
   /**
    * 內部安全寫入 CSSStyleDeclaration 屬性（繞過原型鏈攔截器之重複前置計算）
@@ -162,11 +218,11 @@
     let isSpecificText = false;
 
     if (fontFamily) {
-      if (ICON_PATTERN_REGEX.test(fontFamily)) {
+      if (ICON_FONT_FAMILY_REGEX.test(fontFamily)) {
         // 僅在字型包含 segoe ui symbol 時執行正則替換排除，其餘情況零配置直接判斷
         if (/segoe\s+ui\s+symbol/i.test(fontFamily)) {
           const filteredFamily = fontFamily.replace(/['"]?segoe\s+ui\s+symbol['"]?/gi, '').trim();
-          if (filteredFamily && ICON_PATTERN_REGEX.test(filteredFamily)) {
+          if (filteredFamily && ICON_FONT_FAMILY_REGEX.test(filteredFamily)) {
             return true;
           }
           if (SPECIFIC_TEXT_FONT_REGEX.test(filteredFamily)) {
@@ -175,8 +231,14 @@
         } else {
           return true;
         }
-      } else if (SPECIFIC_TEXT_FONT_REGEX.test(fontFamily)) {
-        isSpecificText = true;
+      } else {
+        // 若已知選擇器非全圖示，無須再跑 SPECIFIC_TEXT_FONT_REGEX（省去每次非圖示規則之正則開銷）
+        if (precomputedAllIcons === false) {
+          return false;
+        }
+        if (SPECIFIC_TEXT_FONT_REGEX.test(fontFamily)) {
+          isSpecificText = true;
+        }
       }
     }
 
@@ -207,7 +269,7 @@
     if (isSelectorMono) {
       return true;
     }
-    if (fontFamily && (MONO_FONT_REGEX.test(fontFamily) || /var\([^)]*(?:mono|code)/i.test(fontFamily))) {
+    if (fontFamily && (MONO_FONT_REGEX.test(fontFamily) || (fontFamily.includes('var(') && /var\([^)]*(?:mono|code)/i.test(fontFamily)))) {
       return true;
     }
     return false;
@@ -222,6 +284,35 @@
    */
   function isAlreadyPrepended(fontFamily, isMono) {
     if (!fontFamily) return false;
+    const c0 = fontFamily.charCodeAt(0);
+    // 快速首字元預篩：'G'/'g' (71/103), 'N'/'n' (78/110), 'I'/'i' (73/105), '"' (34), "'" (39), 空白 (<=32)
+    if (
+      c0 !== 34 &&
+      c0 !== 39 &&
+      c0 !== 71 &&
+      c0 !== 103 &&
+      c0 !== 78 &&
+      c0 !== 110 &&
+      c0 !== 73 &&
+      c0 !== 105 &&
+      c0 > 32
+    ) {
+      return false;
+    }
+    if (c0 === 34 || c0 === 39) {
+      const c1 = fontFamily.charCodeAt(1);
+      if (
+        c1 !== 71 &&
+        c1 !== 103 &&
+        c1 !== 78 &&
+        c1 !== 110 &&
+        c1 !== 73 &&
+        c1 !== 105 &&
+        c1 > 32
+      ) {
+        return false;
+      }
+    }
     return isMono ? ALREADY_MONO_REGEX.test(fontFamily) : ALREADY_SANS_REGEX.test(fontFamily);
   }
 
@@ -237,36 +328,74 @@
       return fontFamily;
     }
 
-    const trimmed = fontFamily.trim();
-    if (!trimmed || CSS_SYSTEM_KEYWORDS_REGEX.test(trimmed)) {
+    if (fontFamily === lastRawFont && selector === lastRawSelector) {
+      return lastPrependedResult;
+    }
+
+    const len = fontFamily.length;
+    const trimmed = (fontFamily.charCodeAt(0) <= 32 || fontFamily.charCodeAt(len - 1) <= 32)
+      ? fontFamily.trim()
+      : fontFamily;
+    if (!trimmed || (trimmed.length <= 12 && (CSS_SYSTEM_KEYWORDS_SET.has(trimmed) || CSS_SYSTEM_KEYWORDS_REGEX.test(trimmed)))) {
       return fontFamily;
     }
 
-    // 選擇器語意狀態正規化：> 98% 常規選擇器不具圖示或等寬特徵，直接共用 trimmed 作為快取鍵
-    let selIcon = false;
-    let selMono = false;
-    let cacheKey = trimmed;
-
-    if (selector && SELECTOR_HINT_REGEX.test(selector)) {
-      selIcon = isAllSelectorPartsIcon(selector);
-      selMono = MONO_SELECTOR_REGEX.test(selector);
-      if (selIcon || selMono) {
-        cacheKey = `${selIcon ? (selMono ? 3 : 2) : 1}|${trimmed}`;
+    // 選擇器語意狀態正規化：> 98% 常規選擇器不具圖示或等寬特徵，直接查表 neutralFontCache 免除字串拼接
+    const selState = selector ? getSelectorState(selector) : 0;
+    if (selState === 0) {
+      const cachedNeutral = neutralFontCache.get(trimmed);
+      if (cachedNeutral !== undefined) {
+        lastRawFont = fontFamily;
+        lastRawSelector = selector;
+        lastPrependedResult = cachedNeutral;
+        return cachedNeutral;
       }
+
+      if (isIconFont('', trimmed, false)) {
+        setCacheEntry(neutralFontCache, trimmed, fontFamily);
+        lastRawFont = fontFamily;
+        lastRawSelector = selector;
+        lastPrependedResult = fontFamily;
+        return fontFamily;
+      }
+
+      const mono = isMonospace('', trimmed, false);
+      if (isAlreadyPrepended(trimmed, mono)) {
+        setCacheEntry(neutralFontCache, trimmed, fontFamily);
+        lastRawFont = fontFamily;
+        lastRawSelector = selector;
+        lastPrependedResult = fontFamily;
+        return fontFamily;
+      }
+
+      const result = (mono ? MONO_PREPEND_STR : SANS_PREPEND_STR) + trimmed;
+      setCacheEntry(neutralFontCache, trimmed, result);
+      lastRawFont = fontFamily;
+      lastRawSelector = selector;
+      lastPrependedResult = result;
+      return result;
     }
+
+    const cacheKey = SELECTOR_STATE_PREFIX[selState] + trimmed;
 
     // 優先查詢 O(1) 快取
     const cached = fontCache.get(cacheKey);
     if (cached !== undefined) {
+      lastRawFont = fontFamily;
+      lastRawSelector = selector;
+      lastPrependedResult = cached;
       return cached;
     }
 
+    const selIcon = selState >= 2;
+    const selMono = (selState & 1) === 1;
+
     // 特例一：圖示字型排除保護
     if (isIconFont(selector, trimmed, selIcon)) {
-      if (fontCache.size >= MAX_CACHE_SIZE) {
-        fontCache.delete(fontCache.keys().next().value);
-      }
-      fontCache.set(cacheKey, fontFamily);
+      setCacheEntry(fontCache, cacheKey, fontFamily);
+      lastRawFont = fontFamily;
+      lastRawSelector = selector;
+      lastPrependedResult = fontFamily;
       return fontFamily;
     }
 
@@ -275,21 +404,21 @@
 
     // 冪等性防重複檢查
     if (isAlreadyPrepended(trimmed, mono)) {
-      if (fontCache.size >= MAX_CACHE_SIZE) {
-        fontCache.delete(fontCache.keys().next().value);
-      }
-      fontCache.set(cacheKey, fontFamily);
+      setCacheEntry(fontCache, cacheKey, fontFamily);
+      lastRawFont = fontFamily;
+      lastRawSelector = selector;
+      lastPrependedResult = fontFamily;
       return fontFamily;
     }
 
     // 特例三：若含有 CSS 變數 var(...)，在其前方前置依然是合法 CSS 語法
     const prependStr = mono ? MONO_PREPEND_STR : SANS_PREPEND_STR;
-    const result = `${prependStr}${trimmed}`;
+    const result = prependStr + trimmed;
 
-    if (fontCache.size >= MAX_CACHE_SIZE) {
-      fontCache.delete(fontCache.keys().next().value);
-    }
-    fontCache.set(cacheKey, result);
+    setCacheEntry(fontCache, cacheKey, result);
+    lastRawFont = fontFamily;
+    lastRawSelector = selector;
+    lastPrependedResult = result;
     return result;
   }
 
@@ -338,14 +467,50 @@
     let result = cssText;
     // 修復相對 url(...) 路徑
     if (baseUrl && result.includes('url(')) {
+      let normalizedBase = '';
+      let baseParentDir = '';
+      try {
+        const parsedBase = new URL(baseUrl);
+        const lastSlash = parsedBase.pathname.lastIndexOf('/');
+        const dirPath = lastSlash !== -1 ? parsedBase.pathname.slice(0, lastSlash + 1) : '/';
+        normalizedBase = `${parsedBase.origin}${dirPath}`;
+        const parentSlash = dirPath.length > 1 ? dirPath.lastIndexOf('/', dirPath.length - 2) : -1;
+        baseParentDir = parentSlash !== -1 ? `${parsedBase.origin}${dirPath.slice(0, parentSlash + 1)}` : normalizedBase;
+      } catch {
+        // 忽略無效 baseUrl
+      }
+
       result = result.replace(/url\(\s*(['"]?)(.*?)\1\s*\)/gi, (match, quote, rawUrl) => {
         const trimmed = rawUrl.trim();
-        if (!trimmed || trimmed.startsWith('data:') || trimmed.startsWith('blob:') || trimmed.startsWith('#') || /^(?:https?:)?\/\//i.test(trimmed)) {
+        if (!trimmed) return match;
+        const c0 = trimmed.charCodeAt(0);
+        // 快速排除 '#' (35) 或協定相對/絕對路徑
+        if (
+          c0 === 35 ||
+          trimmed.startsWith('data:') ||
+          trimmed.startsWith('blob:') ||
+          trimmed.startsWith('http://') ||
+          trimmed.startsWith('https://') ||
+          trimmed.startsWith('//')
+        ) {
           return match;
+        }
+        const q = quote || '"';
+        // 針對最常見的 '../xxx' 與 './xxx' 或純相對檔名執行零配置字串拼接，免除每次建構 new URL() 實例開銷
+        if (normalizedBase && !trimmed.includes('://')) {
+          if (trimmed.startsWith('../') && !trimmed.startsWith('../../') && baseParentDir) {
+            return `url(${q}${baseParentDir}${trimmed.slice(3)}${q})`;
+          }
+          if (trimmed.startsWith('./') && !trimmed.includes('../')) {
+            return `url(${q}${normalizedBase}${trimmed.slice(2)}${q})`;
+          }
+          if (c0 !== 47 && !trimmed.startsWith('.') && !trimmed.includes('../')) {
+            return `url(${q}${normalizedBase}${trimmed}${q})`;
+          }
         }
         try {
           const absUrl = new URL(trimmed, baseUrl).href;
-          return `url(${quote || '"'}${absUrl}${quote || '"'})`;
+          return `url(${q}${absUrl}${q})`;
         } catch {
           return match;
         }

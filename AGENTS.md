@@ -91,7 +91,7 @@
 
 ### 4.2 新增特殊圖示或程式碼編輯器支援
 * **擴充圖示庫或等寬選擇器特徵（重要同步約束）**：
-  * 在 `src/FontPrepender.user.js` 中的 `ICON_PATTERN_REGEX` 或 `MONO_SELECTOR_REGEX` 加入新關鍵字時，**必須同步更新 `SELECTOR_HINT_REGEX`**，確保快取鍵語意正規化篩選器能識別該新特徵。
+  * 在 `src/FontPrepender.user.js` 中的 `ICON_PATTERN_REGEX` 或 `MONO_SELECTOR_REGEX` 加入新關鍵字時，`SELECTOR_HINT_REGEX` 會自動透過 `new RegExp` 動態合成；若新增的圖示關鍵字亦可能出現在 `font-family` 名稱中，請同步加入 `ICON_FONT_FAMILY_REGEX`。
 * **擴充編輯器選擇器**：在 `EDITOR_CONTAINER_SELECTORS` 常數追加目標容器類別（如 `.my-custom-editor`）。
 
 ---
@@ -110,14 +110,15 @@ npm run check
 ```bash
 npm run test
 ```
-* **驗收標準**：`tests/parser.test.js`、`tests/dom.test.js` 與 `tests/sites.test.js` 全部 50 項測試綠燈通過。
+* **驗收標準**：`tests/parser.test.js`、`tests/dom.test.js` 與 `tests/sites.test.js` 全部 58 項測試綠燈通過。
 
 ### 5.3 量化效能評估 (Performance Benchmark)
 ```bash
 npm run bench
 ```
 * **通過門檻指標**：
-  1. **字串解析吞吐量**：10,000 條複雜規則解析耗時 **< 15.0 ms**。
-  2. **大型 CSSOM 掃描**：2,000 條樣式規則初次掃描改寫 **< 16.6 ms**（60 FPS 幀預算內）。
-  3. **突發 DOM 負載**：5,000 個動態節點變動主執行緒阻塞 **< 10.0 ms**。
-  4. **記憶體防護檢測**：所有全域追蹤結構使用 `WeakSet`，零強引用洩漏。
+  1. **字串解析吞吐量**：10,000 條複雜規則（含選擇器特徵判定）解析耗時 **< 2.0 ms**（平均單條 `< 0.0002 ms`）。
+  2. **大型 CSSOM 掃描**：2,000 條樣式規則初次掃描改寫 **< 1.5 ms**。
+  3. **突發 DOM 負載**：5,000 個動態節點（含行內樣式改寫）變動主執行緒阻塞 **< 1.5 ms**。
+  4. **純文字 CSS 改寫吞吐量**：1,000 條含 `@font-face` 與相對 `url()` 之規則改寫 **< 2.0 ms**。
+  5. **100% Cache Miss 冷解析與記憶體防護檢測**：2,500 筆唯一字型堆疊冷解析與 FIFO 淘汰耗時 **< 2.5 ms**，且所有全域追蹤結構使用 `WeakSet` / `WeakMap`，零強引用洩漏。
