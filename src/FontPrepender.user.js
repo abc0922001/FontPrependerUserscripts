@@ -418,8 +418,9 @@
   /**
    * 遞迴處理 CSS 規則列表（支援媒體查詢、容器查詢與 CSS 變數）
    * @param {CSSRuleList} rules 規則列表
+   * @param {boolean} [hasFontVars=true] 樣式表是否可能含有字型相關 CSS 自訂變數
    */
-  function processRules(rules) {
+  function processRules(rules, hasFontVars = true) {
     if (!rules) return;
     const len = rules.length;
     for (let i = 0; i < len; i++) {
@@ -429,7 +430,10 @@
       // 標準樣式規則 (CSSStyleRule)
       if (rule.style && rule.selectorText) {
         // A. 處理常規 font-family
-        const currentFont = rule.style.getPropertyValue('font-family');
+        // 若環境支援 style.fontFamily 且為空字串，直接 O(1) 短路跳過 getPropertyValue 呼叫
+        const currentFont = typeof rule.style.fontFamily === 'string'
+          ? (rule.style.fontFamily ? rule.style.getPropertyValue('font-family') : '')
+          : rule.style.getPropertyValue('font-family');
         if (currentFont) {
           const newFont = prependFontFamily(currentFont, rule.selectorText);
           if (newFont !== currentFont) {
@@ -439,13 +443,8 @@
         }
 
         // B. 特例三：處理 CSS Custom Properties（例如 --font-sans, --code-font）
-        // 優先透過 cssText 包含 '--' 進行 O(1) 預篩選，跳過 99.5% 無自訂變數規則之屬性索引迴圈
-        const styleCssText = rule.style.cssText;
-        const mayHaveCustomProps = typeof styleCssText === 'string'
-          ? styleCssText.includes('--')
-          : rule.style.length > 0;
-
-        if (mayHaveCustomProps) {
+        // 由樣式表層級 hasFontVars 預篩與 rule.style.length 雙重守衛，免除 rule.style.cssText 序列化開銷
+        if (hasFontVars && rule.style.length > 0) {
           const styleLen = rule.style.length;
           for (let p = 0; p < styleLen; p++) {
             const propName = rule.style[p];
@@ -467,7 +466,7 @@
 
       // 巢狀群組規則（例如 @media, @supports, @container）
       if (rule.cssRules) {
-        processRules(rule.cssRules);
+        processRules(rule.cssRules, hasFontVars);
       }
     }
   }
@@ -481,6 +480,18 @@
       return;
     }
 
+    // 樣式表層級預篩：若為內嵌 <style> 標籤且內容完全不含字型關鍵字，O(1) 短路跳過 cssRules 走訪
+    let hasFontVars = true;
+    const owner = sheet.ownerNode;
+    if (owner && (owner.tagName === 'STYLE' || owner.tagName === 'style') && typeof owner.textContent === 'string') {
+      const sheetText = owner.textContent;
+      if (!/font|family|@import/i.test(sheetText)) {
+        processedStyleSheets.add(sheet);
+        return;
+      }
+      hasFontVars = /--[\w-]*(?:font|family)/i.test(sheetText);
+    }
+
     let rules;
     try {
       rules = sheet.cssRules;
@@ -490,7 +501,6 @@
 
       // 若為外部 link 樣式表且支援 fetch，嘗試直接下載改寫注入（解決 XDA 等 CDN 外部樣式表）
       const href = sheet.href;
-      const owner = sheet.ownerNode;
       if (typeof fetch === 'function' && href && !fetchedStyleSheetUrls.has(href)) {
         fetchedStyleSheetUrls.add(href);
         fetch(href)
@@ -536,7 +546,7 @@
 
     if (rules) {
       processedStyleSheets.add(sheet);
-      processRules(rules);
+      processRules(rules, hasFontVars);
     }
   }
 
