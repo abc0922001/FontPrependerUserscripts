@@ -928,21 +928,34 @@
               }
             } else {
               hasAddedElements = true;
-              // 增量掃描新增之局部子樹（葉節點 O(1) 短路，容器子樹 O(ΔN)，避免重掃整份文件 O(N)）
-              scanAndPatchInlineStyles(node);
-              if (node.firstElementChild && typeof node.querySelectorAll === 'function') {
-                const nestedStyles = node.querySelectorAll('style, link[rel="stylesheet"]');
-                const nestedLen = nestedStyles.length;
-                for (let k = 0; k < nestedLen; k++) {
-                  const styleNode = nestedStyles[k];
-                  if (styleNode.sheet) {
-                    processStyleSheet(styleNode.sheet);
-                  } else if ((styleNode.tagName === 'LINK' || styleNode.tagName === 'link') && typeof styleNode.addEventListener === 'function') {
-                    styleNode.addEventListener('load', () => {
-                      if (styleNode.sheet) processStyleSheet(styleNode.sheet);
-                    }, { once: true });
-                  } else {
-                    shouldScanStylesheets = true;
+              const isDocLoading = (targetDoc.ownerDocument || targetDoc).readyState === 'loading';
+              if (isDocLoading) {
+                // 首屏 HTML 解析期：原生串流解析器會逐一派發節點，僅做 O(1) 自身單節點行內樣式檢查，避免子樹重複遍歷
+                if (
+                  (typeof node.hasAttribute !== 'function' || node.hasAttribute('style')) &&
+                  node.style &&
+                  typeof node.style.getPropertyValue === 'function' &&
+                  node.style.getPropertyValue('font-family')
+                ) {
+                  patchElementInlineStyle(node);
+                }
+              } else {
+                // 互動期（SPA 動態渲染）：增量掃描新增之局部子樹（葉節點 O(1) 短路，容器子樹 O(ΔN)）
+                scanAndPatchInlineStyles(node);
+                if (node.firstElementChild && typeof node.querySelectorAll === 'function') {
+                  const nestedStyles = node.querySelectorAll('style, link[rel="stylesheet"]');
+                  const nestedLen = nestedStyles.length;
+                  for (let k = 0; k < nestedLen; k++) {
+                    const styleNode = nestedStyles[k];
+                    if (styleNode.sheet) {
+                      processStyleSheet(styleNode.sheet);
+                    } else if ((styleNode.tagName === 'LINK' || styleNode.tagName === 'link') && typeof styleNode.addEventListener === 'function') {
+                      styleNode.addEventListener('load', () => {
+                        if (styleNode.sheet) processStyleSheet(styleNode.sheet);
+                      }, { once: true });
+                    } else {
+                      shouldScanStylesheets = true;
+                    }
                   }
                 }
               }
@@ -983,8 +996,10 @@
     // 4. 靜態同源 CSSOM 掃描
     scanAndPatchStyleSheets(document);
 
-    // 5. 掃描行內樣式 (解決 UNIKO's Hardware 等 CMS 文章行內樣式覆寫)
-    scanAndPatchInlineStyles(document);
+    // 5. 掃描行內樣式 (若已進入 DOMContentLoaded 之後則立即執行，loading 期間留待 DOMContentLoaded 統一執行)
+    if (document.readyState !== 'loading') {
+      scanAndPatchInlineStyles(document);
+    }
 
     // 6. 監聽動態樣式注入與行內樣式變更
     observeStyleSheets(document);
@@ -1004,7 +1019,6 @@
     // 8. window load 完成後若存在跨域樣式表，執行一次 computed style patch
     if (typeof window !== 'undefined') {
       window.addEventListener('load', () => {
-        scanAndPatchInlineStyles(document);
         if (hasCorsSheets) {
           scheduleIdleComputedStylePatch();
         }
