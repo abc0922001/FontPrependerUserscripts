@@ -646,14 +646,16 @@
       'h1, h2, h3, h4, h5, h6, [class*="title"], [class*="heading"], [class*="card"] a, [class*="post"] a, main, article, section, header, p, code, pre, [class*="content"], [class*="editor"], time, [class*="date"], [class*="meta"], [class*="author"], [class*="byline"], [class*="time"], [class*="published"]'
     );
 
-    const count = Math.min(sampleTargets.length, 500);
+    const totalLen = sampleTargets.length;
+    let sampledCount = 0;
     const pendingWrites = [];
 
     // 第一階段（Batch Read）：純讀取 getComputedStyle 並收集待修補節點，期間零 DOM 樣式寫入
-    for (let i = 0; i < count; i++) {
+    for (let i = 0; i < totalLen && sampledCount < 500; i++) {
       const el = sampleTargets[i];
       if (!el || processedElements.has(el)) continue;
       processedElements.add(el);
+      sampledCount++;
 
       try {
         const computed = window.getComputedStyle(el);
@@ -680,7 +682,7 @@
             const targetFont = `${isMono ? MONO_PREPEND_STR : SANS_PREPEND_STR}${computedFont}`;
             pendingWrites.push({ el, targetFont });
 
-            // 若父容器為標題或元數據容器且包含 a、span、time 標籤，同步將內部文字節點加入批次寫入佇列
+            // 若父容器為標題或元數據容器且包含 a、span、time 標籤，同步將內部文字節點加入批次寫入佇列（排除內嵌圖示節點）
             const isContainer = el.matches ? el.matches('h1, h2, h3, h4, h5, h6, [class*="title"], [class*="heading"], [class*="card"], [class*="post"], [class*="meta"], [class*="byline"]') : true;
             if (isContainer) {
               const childElements = el.querySelectorAll ? el.querySelectorAll('a, span, time') : null;
@@ -689,6 +691,11 @@
                   const child = childElements[c];
                   if (child && !processedElements.has(child)) {
                     processedElements.add(child);
+                    const childId = child.id || '';
+                    const childClass = child.className && typeof child.className === 'string' ? child.className : '';
+                    if ((childId && ICON_PATTERN_REGEX.test(childId)) || (childClass && ICON_PATTERN_REGEX.test(childClass))) {
+                      continue;
+                    }
                     pendingWrites.push({ el: child, targetFont });
                   }
                 }

@@ -143,6 +143,30 @@ describe('真實網站排版與邊界條件覆蓋測試 (Real-World Sites Covera
       expect(a.style.getPropertyValue('font-family')).toContain('Google Sans');
       expect(a.style.getPropertyValue('font-family')).toContain('Titillium Web');
     });
+
+    it('patchComputedStyles 修補標題時應跳過內嵌圖示 span（避免 .fa / .icon-* 被強制覆寫）', () => {
+      const dom = new JSDOM(`<!DOCTYPE html><html><head></head><body>
+        <h3 class="display-card-title">
+          <span class="fa fa-fire"></span>
+          <a href="/hot-news/">Hot Tech News</a>
+        </h3>
+      </body></html>`);
+
+      const { window } = dom;
+      const { document } = window;
+      const scopedScript = loadUserscript({ window, document });
+
+      window.getComputedStyle = () => ({ fontFamily: '"Titillium Web", sans-serif' });
+      scopedScript.patchComputedStyles();
+
+      const h3 = document.querySelector('h3.display-card-title');
+      const iconSpan = h3.querySelector('span.fa-fire');
+      const link = h3.querySelector('a');
+
+      expect(h3.style.getPropertyValue('font-family')).toContain('Google Sans');
+      expect(link.style.getPropertyValue('font-family')).toContain('Google Sans');
+      expect(iconSpan.style.getPropertyValue('font-family')).toBe('');
+    });
   });
 
   // ---------------------------------------------------------------------------
