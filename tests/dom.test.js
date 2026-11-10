@@ -263,4 +263,63 @@ describe('DOM / CSSOM 與特例整合測試', () => {
     iconEl.style.setProperty('font-family', 'sans-serif');
     expect(iconEl.style.getPropertyValue('font-family')).toBe('sans-serif');
   });
+
+  // Issue #4: Chrome 內建整頁翻譯相容性防護
+  it('9. isTranslationNode 應精確識別 Chrome 整頁翻譯產生的純翻譯節點', () => {
+    const { document, exports } = createEnvironment();
+    const { isTranslationNode } = exports;
+
+    const fontEl = document.createElement('font');
+    fontEl.setAttribute('style', 'vertical-align: inherit;');
+    expect(isTranslationNode(fontEl)).toBe(true);
+
+    const normalDiv = document.createElement('div');
+    expect(isTranslationNode(normalDiv)).toBe(false);
+
+    // 若使用者或網站顯式指定了 font-family 於 <font> 上，不應視為純翻譯節點
+    const styledFont = document.createElement('font');
+    styledFont.style.fontFamily = 'Arial, sans-serif';
+    expect(isTranslationNode(styledFont)).toBe(false);
+  });
+
+  it('10. Chrome 整頁翻譯注入動態 <font> 節點時，不應誘發子樹重排、樣式覆寫或跨域計算修補排程 (Issue #4)', async () => {
+    const { document, exports, window } = createEnvironment('<!DOCTYPE html><html><head></head><body><p id="article-p"></p></body></html>');
+    window.requestIdleCallback = vi.fn();
+
+    // 模擬已存在跨域樣式表 (hasCorsSheets)
+    const mockCorsSheet = {
+      get cssRules() {
+        throw new Error('SecurityError');
+      }
+    };
+    exports.processStyleSheet(mockCorsSheet);
+    expect(exports.getHasCorsSheets()).toBe(true);
+
+    // 等待 JSDOM 首屏生命週期 (DOMContentLoaded / Load) 事件消化完畢
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    window.requestIdleCallback.mockClear();
+
+    const paragraph = document.getElementById('article-p');
+
+    // 模擬 Chrome 整頁翻譯：將段落內的英文 Text 替換為雙層 <font> 標籤
+    const outerFont = document.createElement('font');
+    outerFont.setAttribute('style', 'vertical-align: inherit;');
+    const innerFont = document.createElement('font');
+    innerFont.setAttribute('style', 'vertical-align: inherit;');
+    innerFont.textContent = '繁體中文翻譯文字';
+    outerFont.appendChild(innerFont);
+
+    // 監聽器應在 childList 與 attributes 監聽中忽略 translation nodes
+    paragraph.appendChild(outerFont);
+
+    // 等待 MutationObserver 非同步事件派發
+    await new Promise((resolve) => setTimeout(resolve, 30));
+
+    // 驗證未對 <font> 標籤寫入任何 font-family 內聯樣式
+    expect(outerFont.style.getPropertyValue('font-family')).toBe('');
+    expect(innerFont.style.getPropertyValue('font-family')).toBe('');
+
+    // 驗證未觸發跨域樣式空閒期修補排程 (requestIdleCallback)
+    expect(window.requestIdleCallback).not.toHaveBeenCalled();
+  });
 });

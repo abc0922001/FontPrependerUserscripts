@@ -2,7 +2,7 @@
 // @name         Font Prepender - 自訂網頁與程式碼首選字型
 // @name:zh-TW   Font Prepender - 自訂網頁與程式碼首選字型
 // @namespace    https://greasyfork.org/zh-TW/users/1237813-abc0922001
-// @version      1.0.3
+// @version      1.0.4
 // @description  將 Google Sans、Noto Sans CJK TC 與 Intel One Mono、Noto Sans Mono CJK TC 前置於網頁字型清單最前方，不破壞原始排版與圖示字型
 // @description:zh-TW 將 Google Sans、Noto Sans CJK TC 與 Intel One Mono、Noto Sans Mono CJK TC 前置於網頁字型清單最前方，不破壞原始排版與圖示字型
 // @author       abc0922001
@@ -181,6 +181,23 @@
     } finally {
       isInternalStyleWrite = false;
     }
+  }
+
+  /**
+   * 檢測是否為 Chrome / Google 內建整頁翻譯動態注入之包裝節點（如 <font>）
+   * 針對純翻譯包裝節點採取被動字型繼承，避免觸發子樹掃描、空閒修補排程與前端框架重繪
+   * @param {Node|Element} node 目標 DOM 元素節點
+   * @returns {boolean} 是否為純翻譯包裝節點
+   */
+  function isTranslationNode(node) {
+    if (!node || node.nodeType !== 1) return false;
+    const tag = node.tagName;
+    if (tag === 'FONT' || tag === 'font') {
+      if (!node.style || typeof node.style.getPropertyValue !== 'function' || !node.style.getPropertyValue('font-family')) {
+        return true;
+      }
+    }
+    return false;
   }
 
   /**
@@ -830,6 +847,7 @@
    */
   function scanAndPatchInlineStyles(root = document) {
     if (!root) return;
+    if (root.nodeType === 1 && isTranslationNode(root)) return;
 
     if (root.nodeType === 1) {
       if (
@@ -917,7 +935,7 @@
             const targetFont = `${isMono ? MONO_PREPEND_STR : SANS_PREPEND_STR}${computedFont}`;
             pendingWrites.push({ el, targetFont });
 
-            // 若父容器為標題或元數據容器且包含 a、span、time 標籤，同步將內部文字節點加入批次寫入佇列（排除內嵌圖示節點）
+            // 若父容器為標題或元數據容器且包含 a、span、time 標籤，同步將內部文字節點加入批次寫入佇列（排除內嵌圖示節點與純翻譯標籤）
             const isContainer = el.matches ? el.matches('h1, h2, h3, h4, h5, h6, [class*="title"], [class*="heading"], [class*="card"], [class*="post"], [class*="meta"], [class*="byline"]') : true;
             if (isContainer) {
               const childElements = el.querySelectorAll ? el.querySelectorAll('a, span, time') : null;
@@ -925,6 +943,9 @@
                 for (let c = 0; c < childElements.length; c++) {
                   const child = childElements[c];
                   if (child && !processedElements.has(child)) {
+                    if (isTranslationNode(child)) {
+                      continue;
+                    }
                     processedElements.add(child);
                     const childId = child.id || '';
                     const childClass = child.className && typeof child.className === 'string' ? child.className : '';
@@ -1199,6 +1220,7 @@
 
         // 1. 監聽行內 style 屬性動態變更
         if (mutation.type === 'attributes' && mutation.attributeName === 'style') {
+          if (isTranslationNode(mutation.target)) continue;
           patchElementInlineStyle(mutation.target);
         } else if (mutation.type === 'childList') {
           const added = mutation.addedNodes;
@@ -1206,6 +1228,7 @@
           for (let j = 0; j < addedLen; j++) {
             const node = added[j];
             if (!node || node.nodeType !== 1) continue;
+            if (isTranslationNode(node)) continue;
             const tagName = node.tagName;
 
             if (node.shadowRoot) {
@@ -1346,6 +1369,7 @@
       isIconFont,
       isMonospace,
       isAlreadyPrepended,
+      isTranslationNode,
       prependFontFamily,
       rewriteCssContent,
       injectBaseStyles,

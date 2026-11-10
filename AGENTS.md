@@ -77,6 +77,8 @@
   * 針對含有跨域（CORS）樣式表的頁面，於 `requestIdleCallback` 空閒期抽樣修補時，必須嚴格區分為 **第一階段（Batch Read：純讀取 `getComputedStyle` 並收集佇列）** 與 **第二階段（Batch Write：一次性寫入 `setStylePropertyInternal`）**，嚴禁在迴圈中交錯讀寫引發瀏覽器強制同步重排（Style Thrashing）。
 * **WeakSet 弱引用追蹤**：樣式表（`processedStyleSheets`）、ShadowRoot（`processedShadowRoots`）與抽樣元素（`processedElements`）皆使用 `WeakSet`，確保原生節點釋放時垃圾回收順暢。
 * **Shadow DOM 穿透**：攔截 `Element.prototype.attachShadow`，自動在 open 模式 ShadowRoot 下掛載樣式與監聽。
+* **Chrome 內建整頁翻譯隔離護欄 (`isTranslationNode`)**：
+  * 當 Chrome 翻譯將文字節點包裝為 `<font style="vertical-align: inherit;">` 標籤時，`MutationObserver` 與 `patchComputedStyles` 透過 `isTranslationNode` 在 $\mathcal{O}(1)$ 時間內精確短路忽略，不修改其內聯 `style` 屬性，亦不將其視為新增容器誤觸發跨域樣式修補排程，確保純翻譯標籤維持純淨並被動繼承父層字型，徹底杜絕 SPA 前端框架重繪衝突。
 
 ---
 
@@ -110,7 +112,7 @@ npm run check
 ```bash
 npm run test
 ```
-* **驗收標準**：`tests/parser.test.js`、`tests/dom.test.js` 與 `tests/sites.test.js` 全部 58 項測試綠燈通過。
+* **驗收標準**：`tests/parser.test.js`、`tests/dom.test.js` 與 `tests/sites.test.js` 全部 60 項測試綠燈通過。
 
 ### 5.3 量化效能評估 (Performance Benchmark)
 ```bash
