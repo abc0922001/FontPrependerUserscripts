@@ -50,9 +50,10 @@
 1. **防禦性過濾**：
    * 空字串或非字串直接返回。
    * CSS 保留系統關鍵字（`inherit`、`initial`、`unset`、`revert`、`revert-layer`）原樣保留，禁止破壞 CSS 繼承鏈。
-2. **選擇器語意狀態正規化與 $\mathcal{O}(1)$ 快取 (`SELECTOR_HINT_REGEX` & `fontCache`)**：
+2. **選擇器語意狀態正規化與 $\mathcal{O}(1)$ FIFO 快取 (`SELECTOR_HINT_REGEX` & `fontCache`)**：
    * **嚴禁將原始完整 `selector` 直接拼接至快取鍵**（否則在數千條相異選擇器規則的 CSSOM 中快取命中率會退化為 0%）。
    * 透過 `SELECTOR_HINT_REGEX` 快速篩選選擇器是否帶有圖示或等寬特徵：超過 98% 的中性選擇器直接共用 `trimmed` 字型字串作為快取鍵；命中特殊特徵者則降維映射至語意狀態前綴（`1|` 等寬、`2|` 全圖示、`3|` 雙重），確保跨規則快取命中率 $> 99\%$ 且快取空間嚴格收斂於唯一字型數 $\mathcal{O}(F)$。
+   * 快取容量上限為 1,000 筆，達到上限時嚴格採用 **有界 $\mathcal{O}(1)$ FIFO 單筆淘汰**（`Map.keys().next().value`），僅淘汰最舊項目，徹底保留熱點快取並杜絕清空快取造成的重算抖動。
 3. **圖示字型排除 (Icon Font Guard)**：
    * 檢查選擇器與字型名稱是否命中 `ICON_PATTERN_REGEX`（如 `FontAwesome`, `Material Icons`, `codicon`, `octicons`, `flowplayer` 等）。
    * 處理含逗號 `,` 之群組選擇器時，透過 `isAllSelectorPartsIcon` 以 `indexOf(',', start)` 雙指針索引切片掃描，避免 `.split(',')` 產生暫時陣列配置。
@@ -70,13 +71,17 @@
 * **CSSOM 掃描 (`processRules`)**：遞迴走訪 `CSSStyleRule` 與巢狀分組規則（`@media`, `@supports`, `@container`），並支援 `:root` 等規則內之 `--font-*` CSS 自訂變數前置。
 * **內部寫入重入防護 (`isInternalStyleWrite` & `setStylePropertyInternal`)**：
   * 由於 `hookCSSPrototypes` 攔截了 `CSSStyleDeclaration.prototype.setProperty` 與 `fontFamily` setter，腳本內部（`processRules`、`patchElementInlineStyle`、`patchComputedStyles`）寫回已前置字型時，**必須統一呼叫 `setStylePropertyInternal`**，以 $\mathcal{O}(1)$ 旗標跳過攔截器二次解析與快取污染。
-* **動態 DOM 增量局部掃描 (`observeStyleSheets` & `scanAndPatchInlineStyles`)**：
+* **動態 DOM 增量單次掃描、剪枝與祖先去重 (`observeStyleSheets` & `scanAndPatchInlineStyles`)**：
   * **嚴禁在 `MutationObserver` 的 `childList` 事件中對整份 `targetDoc` 重新執行全樹 `querySelectorAll`**（否則在動態 SPA 頁面會退化為 $\mathcal{O}(N^2)$ 複雜度）。
-  * 新增元素節點僅針對該局部子樹呼叫 `scanAndPatchInlineStyles(node)`；且對於無子元素之葉節點（`!root.firstElementChild`），必須維持 $\mathcal{O}(1)$ 短路返回，免除無謂的 `querySelectorAll` 開銷。
-* **計算樣式修補兩階段讀寫分離 (`patchComputedStyles`)**：
-  * 針對含有跨域（CORS）樣式表的頁面，於 `requestIdleCallback` 空閒期抽樣修補時，必須嚴格區分為 **第一階段（Batch Read：純讀取 `getComputedStyle` 並收集佇列）** 與 **第二階段（Batch Write：一次性寫入 `setStylePropertyInternal`）**，嚴禁在迴圈中交錯讀寫引發瀏覽器強制同步重排（Style Thrashing）。
-* **WeakSet 弱引用追蹤**：樣式表（`processedStyleSheets`）、ShadowRoot（`processedShadowRoots`）與抽樣元素（`processedElements`）皆使用 `WeakSet`，確保原生節點釋放時垃圾回收順暢。
-* **Shadow DOM 穿透**：攔截 `Element.prototype.attachShadow`，自動在 open 模式 ShadowRoot 下掛載樣式與監聽。
+  * 新增元素節點透過 `batchSet` 進行祖先去重（若其祖先已在同一批次則忽略子節點），並以 `PRUNE_TAG_REGEX` 剪枝非文本節點（`SCRIPT`, `SVG` 等）。
+  * 新增容器子樹以單次 `node.querySelectorAll('[style*="font-family" i], style, link[rel="stylesheet"]')` 同時處理行內樣式與巢狀樣式表，徹底消除原先 3 次獨立子樹遍歷開銷。
+  * 同一批次內多筆相同的 `attributes: style` 變更以 `modifiedStyleTargets = new Set()` 合併，保證單一元素單批次僅執行一次樣式檢查。
+* **計算樣式修補時間切片與兩階段讀寫分離 (`patchComputedStyles`)**：
+  * 針對含有跨域（CORS）樣式表的頁面，於空閒期抽樣修補時，結合 `IdleDeadline.timeRemaining()` 與 **4ms 時間切片預算**（`SLICE_BUDGET_MS = 4`），嚴格區分為 **第一階段（Batch Read）** 與 **第二階段（Batch Write）**，徹底消除強制同步重排（Style Thrashing）；若元素超過單切片處理上限則自動續排下一批，打破 500 筆上限限制。
+* **跨域樣式表 Fetch 防護**：
+  * 遇到拋出 `SecurityError` 之跨域樣式表時，以 `SKIP_FETCH_HOST_REGEX` 過濾純字型/圖示 CDN（如 `fonts.googleapis.com`、`use.fontawesome.com` 等），且在 `Content-Length > 1MB` 時放棄下載改寫，並透過 `{ cache: 'force-cache' }` 優先命中快取。
+* **WeakSet 弱引用追蹤與 Hook 冪等性**：樣式表（`processedStyleSheets`）、ShadowRoot（`processedShadowRoots`）、已監聽文件（`observedRoots`）與抽樣元素（`processedElements`）皆使用 `WeakSet`；原型鏈攔截器以 `_fpHooked` 標記防重複包裝，`init()` 具備嚴格冪等性。
+* **Shadow DOM 穿透與資源共用**：攔截 `Element.prototype.attachShadow`，並在支援環境下共用預編譯之 Constructable `CSSStyleSheet`，省去各 ShadowRoot 注入 `<style>` 元素開銷。
 * **Chrome 內建整頁翻譯隔離護欄 (`isTranslationNode`)**：
   * 當 Chrome 翻譯將文字節點包裝為 `<font style="vertical-align: inherit;">` 標籤時，`MutationObserver` 與 `patchComputedStyles` 透過 `isTranslationNode` 在 $\mathcal{O}(1)$ 時間內精確短路忽略，不修改其內聯 `style` 屬性，亦不將其視為新增容器誤觸發跨域樣式修補排程，確保純翻譯標籤維持純淨並被動繼承父層字型，徹底杜絕 SPA 前端框架重繪衝突。
 
@@ -112,7 +117,7 @@ npm run check
 ```bash
 npm run test
 ```
-* **驗收標準**：`tests/parser.test.js`、`tests/dom.test.js` 與 `tests/sites.test.js` 全部 60 項測試綠燈通過。
+* **驗收標準**：`tests/parser.test.js`、`tests/dom.test.js` 與 `tests/sites.test.js` 全部 66 項測試綠燈通過。
 
 ### 5.3 量化效能評估 (Performance Benchmark)
 ```bash

@@ -2,7 +2,7 @@
 // @name         Font Prepender - 自訂網頁與程式碼首選字型
 // @name:zh-TW   Font Prepender - 自訂網頁與程式碼首選字型
 // @namespace    https://greasyfork.org/zh-TW/users/1237813-abc0922001
-// @version      1.0.4
+// @version      1.0.5
 // @description  將 Google Sans、Noto Sans CJK TC 與 Intel One Mono、Noto Sans Mono CJK TC 前置於網頁字型清單最前方，不破壞原始排版與圖示字型
 // @description:zh-TW 將 Google Sans、Noto Sans CJK TC 與 Intel One Mono、Noto Sans Mono CJK TC 前置於網頁字型清單最前方，不破壞原始排版與圖示字型
 // @author       abc0922001
@@ -35,6 +35,31 @@
  */
 (() => {
   'use strict';
+
+  // --- 零成本條件式剖析器 (Profiling Infrastructure - Issue #2 Task 0) ---
+  const PROFILE = (() => {
+    try {
+      return typeof localStorage !== 'undefined' && localStorage.getItem('fp-profile') === '1';
+    } catch {
+      return false;
+    }
+  })();
+  const prof = PROFILE ? { t: Object.create(null), n: Object.create(null) } : null;
+  const wrap = (name, fn) => {
+    if (!PROFILE) return fn;
+    return function(...args) {
+      const start = performance.now();
+      try {
+        return fn.apply(this, args);
+      } finally {
+        prof.t[name] = (prof.t[name] || 0) + (performance.now() - start);
+        prof.n[name] = (prof.n[name] || 0) + 1;
+      }
+    };
+  };
+  if (PROFILE && typeof window !== 'undefined') {
+    window.__fpProf = prof;
+  }
 
   // --- 字型配置常數 ---
   const SANS_FONTS = ['"Google Sans"', '"Google Sans Flex"', '"Noto Sans CJK TC"'];
@@ -73,6 +98,16 @@
   // CSS 字型自訂變數特徵
   const CSS_VAR_FONT_REGEX = /^--.*(?:font|family)/i;
 
+  // 非文本節點子樹剪枝特徵（跳過完全不包含排版文本之大型節點）
+  const PRUNE_TAG_REGEX = /^(?:SCRIPT|STYLE|SVG|PATH|NOSCRIPT|IFRAME|CANVAS|VIDEO|AUDIO|HEAD|META|LINK)$/i;
+
+  // 跨域 CSS fetch 跳過主機（字型發布庫或圖示專用 CDN 無需重複下載改寫）
+  const SKIP_FETCH_HOST_REGEX = /(?:^|\.)(?:fonts\.googleapis\.com|fonts\.bunny\.net|use\.typekit\.net|(?:use|kit)\.fontawesome\.com)$/i;
+  const MAX_FETCH_BYTES = 1000000; // 1 MB
+
+  // Computed Style 時間切片預算（毫秒）
+  const SLICE_BUDGET_MS = 4.0;
+
   // 選擇器快速特徵篩選正則（自動合併圖示與等寬選擇器特徵，用於 O(1) 快取鍵狀態正規化）
   const SELECTOR_HINT_REGEX = new RegExp(`(?:${ICON_PATTERN_REGEX.source}|${MONO_SELECTOR_REGEX.source})`, 'i');
 
@@ -98,6 +133,21 @@
   const processedElements = new WeakSet();
   const styleToElementMap = new WeakMap();
   const fetchedStyleSheetUrls = new Set();
+  const observedRoots = new WeakSet();
+
+  // 共用 Constructable Stylesheets 實例（Web Components ShadowRoot 資源共用）
+  let sharedBaseSheet = null;
+  let sharedEditorSheet = null;
+
+  // Computed Style 候選節點增量佇列與游標
+  let computedCandidates = [];
+  let computedCandidateSet = new WeakSet();
+  let computedCursor = 0;
+
+  // 初始化與 Hook 狀態旗標（保證冪等性）
+  let isInitialized = false;
+  let isCSSPrototypesHooked = false;
+  let isShadowDOMHooked = false;
 
   // LRU / FIFO 快取結構（O(1) 查詢，上限 1000 筆防止記憶體洩漏）
   const MAX_CACHE_SIZE = 1000;
@@ -131,14 +181,17 @@
   let isInternalStyleWrite = false;
 
   /**
-   * 寫入字型快取（達上限時採用批次清空策略，將攤銷維護開銷降至 O(1) 且免除每次 Map.keys() 迭代器配置）
+   * 寫入字型快取（達上限時採用 FIFO 淘汰最舊單筆項目，保持高命中率並免除全量清除之快取抖動）
    * @param {Map<string, string>} targetMap 目標快取結構
    * @param {string} key 快取鍵
    * @param {string} val 快取值
    */
   function setCacheEntry(targetMap, key, val) {
     if (targetMap.size >= MAX_CACHE_SIZE) {
-      targetMap.clear();
+      const oldestKey = targetMap.keys().next().value;
+      if (oldestKey !== undefined) {
+        targetMap.delete(oldestKey);
+      }
     }
     targetMap.set(key, val);
   }
@@ -550,10 +603,53 @@
   }
 
   /**
+   * 初始化共用 Constructable Stylesheets（供 ShadowRoot 高效共用，免除重複注入 <style>）
+   */
+  function initSharedConstructableStyles() {
+    if (sharedBaseSheet !== null) return;
+    try {
+      if (typeof CSSStyleSheet === 'function' && 'replaceSync' in CSSStyleSheet.prototype) {
+        sharedBaseSheet = new CSSStyleSheet();
+        sharedBaseSheet.replaceSync(`
+:where(html, body) { font-family: ${BASE_SANS_STACK}; }
+:where(code, pre, kbd, samp, tt, var) { font-family: ${BASE_MONO_STACK}; }
+:where(h1, h2, h3, h4, h5, h6, p, blockquote, q, li, dt, dd, td, th, label, summary, details) { font-family: ${BASE_SANS_STACK}; }
+:where(input, textarea, select, button, [contenteditable="true"]) { font-family: ${BASE_SANS_STACK}; }
+`);
+        processedStyleSheets.add(sharedBaseSheet);
+
+        sharedEditorSheet = new CSSStyleSheet();
+        sharedEditorSheet.replaceSync(`
+:where(${EDITOR_CONTAINER_SELECTORS}) { font-family: ${BASE_MONO_STACK} !important; }
+`);
+        processedStyleSheets.add(sharedEditorSheet);
+      }
+    } catch {
+      sharedBaseSheet = null;
+      sharedEditorSheet = null;
+    }
+  }
+
+  /**
    * 注入基礎層降級樣式與編輯器專屬樣式
    * @param {Document|ShadowRoot} targetRoot 注入目標根節點
    */
   function injectBaseStyles(targetRoot = document) {
+    // Web Components: 若目標為 ShadowRoot 且支援 adoptedStyleSheets，共用預編譯之 Constructable Stylesheet
+    if (targetRoot && targetRoot.adoptedStyleSheets && sharedBaseSheet && sharedEditorSheet) {
+      const adopted = targetRoot.adoptedStyleSheets;
+      if (!adopted.includes(sharedBaseSheet)) {
+        try {
+          targetRoot.adoptedStyleSheets = [...adopted, sharedBaseSheet, sharedEditorSheet];
+          return;
+        } catch {
+          // 若寫入失敗則平滑退回傳統 <style> 注入
+        }
+      } else {
+        return;
+      }
+    }
+
     const parent = targetRoot.head || targetRoot.documentElement || targetRoot;
     if (!parent || !parent.appendChild) return;
 
@@ -618,35 +714,36 @@
       if (!rule) continue;
 
       // 標準樣式規則 (CSSStyleRule)
-      if (rule.style && rule.selectorText) {
+      if (rule.selectorText && rule.style) {
+        const style = rule.style;
         // A. 處理常規 font-family
         // 若環境支援 style.fontFamily 且為空字串，直接 O(1) 短路跳過 getPropertyValue 呼叫
-        const currentFont = typeof rule.style.fontFamily === 'string'
-          ? (rule.style.fontFamily ? rule.style.getPropertyValue('font-family') : '')
-          : rule.style.getPropertyValue('font-family');
+        const currentFont = typeof style.fontFamily === 'string'
+          ? (style.fontFamily ? style.getPropertyValue('font-family') : '')
+          : style.getPropertyValue('font-family');
         if (currentFont) {
           const newFont = prependFontFamily(currentFont, rule.selectorText);
           if (newFont !== currentFont) {
-            const priority = rule.style.getPropertyPriority('font-family');
-            setStylePropertyInternal(rule.style, 'font-family', newFont, priority);
+            const priority = style.getPropertyPriority('font-family');
+            setStylePropertyInternal(style, 'font-family', newFont, priority);
           }
         }
 
         // B. 特例三：處理 CSS Custom Properties（例如 --font-sans, --code-font）
-        // 由樣式表層級 hasFontVars 預篩與 rule.style.length 雙重守衛，免除 rule.style.cssText 序列化開銷
-        if (hasFontVars && rule.style.length > 0) {
-          const styleLen = rule.style.length;
+        // 由樣式表層級 hasFontVars 預篩與 style.length 雙重守衛，免除 style.cssText 序列化開銷
+        if (hasFontVars && style.length > 0) {
+          const styleLen = style.length;
           for (let p = 0; p < styleLen; p++) {
-            const propName = rule.style[p];
+            const propName = style[p];
             if (propName && propName.charCodeAt(0) === 45 && propName.charCodeAt(1) === 45 && CSS_VAR_FONT_REGEX.test(propName)) {
-              const varVal = rule.style.getPropertyValue(propName);
+              const varVal = style.getPropertyValue(propName);
               if (varVal && !CSS_SYSTEM_KEYWORDS_REGEX.test(varVal.trim())) {
                 const isMonoVar = /mono|code/i.test(propName) || isMonospace('', varVal, false);
                 if (!isAlreadyPrepended(varVal, isMonoVar)) {
                   const prependStr = isMonoVar ? MONO_PREPEND_STR : SANS_PREPEND_STR;
                   const newVarVal = `${prependStr}${varVal.trim()}`;
-                  const varPriority = rule.style.getPropertyPriority(propName);
-                  setStylePropertyInternal(rule.style, propName, newVarVal, varPriority);
+                  const varPriority = style.getPropertyPriority(propName);
+                  setStylePropertyInternal(style, propName, newVarVal, varPriority);
                 }
               }
             }
@@ -663,6 +760,19 @@
       if (rule.styleSheet) {
         processStyleSheet(rule.styleSheet);
       }
+    }
+  }
+
+  /**
+   * 安全讀取 CSSStyleSheet.cssRules（隔離 try-catch 避免 V8 TurboFan 內聯受阻）
+   * @param {CSSStyleSheet} sheet 目標樣式表
+   * @returns {CSSRuleList|null} 規則列表或 null（跨域安全例外）
+   */
+  function getSheetRulesSafe(sheet) {
+    try {
+      return sheet.cssRules;
+    } catch {
+      return null;
     }
   }
 
@@ -693,20 +803,39 @@
       hasFontVars = /--[\w-]*(?:font|family)/i.test(sheetText);
     }
 
-    let rules;
-    try {
-      rules = sheet.cssRules;
-    } catch {
+    const rules = getSheetRulesSafe(sheet);
+    if (!rules) {
       // 特例二：跨域樣式表存取拋出 SecurityError
       processedStyleSheets.add(sheet);
 
-      // 若為外部 link 樣式表且支援 fetch，嘗試直接下載改寫注入（解決 XDA 等 CDN 外部樣式表）
       const href = sheet.href;
+      // 跨域 CDN 過濾：若為 Google Fonts / Typekit / FontAwesome 等字型與圖示分發主機，無需重複 fetch 改寫
+      if (href) {
+        try {
+          const host = new URL(href).hostname;
+          if (SKIP_FETCH_HOST_REGEX.test(host)) {
+            hasCorsSheets = true;
+            scheduleIdleComputedStylePatch();
+            return;
+          }
+        } catch {
+          // 容錯防禦
+        }
+      }
+
+      // 若為外部 link 樣式表且支援 fetch，嘗試直接下載改寫注入（解決 XDA 等 CDN 外部樣式表）
       if (typeof fetch === 'function' && href && !fetchedStyleSheetUrls.has(href)) {
         fetchedStyleSheetUrls.add(href);
-        fetch(href)
+        fetch(href, { cache: 'force-cache' })
           .then((res) => {
             if (!res || !res.ok) {
+              hasCorsSheets = true;
+              scheduleIdleComputedStylePatch();
+              return null;
+            }
+            // 檔案大小防護：若 Content-Length 超過 1MB 則放棄文字改寫，避免記憶體暴增
+            const cl = res.headers && res.headers.get('content-length');
+            if (cl && parseInt(cl, 10) > MAX_FETCH_BYTES) {
               hasCorsSheets = true;
               scheduleIdleComputedStylePatch();
               return null;
@@ -745,10 +874,8 @@
       return;
     }
 
-    if (rules) {
-      processedStyleSheets.add(sheet);
-      processRules(rules, hasFontVars);
-    }
+    processedStyleSheets.add(sheet);
+    processRules(rules, hasFontVars);
   }
 
   /**
@@ -820,7 +947,9 @@
   function patchElementInlineStyle(el) {
     if (!el || !el.style || typeof el.style.getPropertyValue !== 'function') return;
 
-    styleToElementMap.set(el.style, el);
+    if (!styleToElementMap.has(el.style)) {
+      styleToElementMap.set(el.style, el);
+    }
 
     const inlineFont = el.style.getPropertyValue('font-family');
     if (!inlineFont || CSS_SYSTEM_KEYWORDS_REGEX.test(inlineFont.trim())) {
@@ -847,7 +976,7 @@
    */
   function scanAndPatchInlineStyles(root = document) {
     if (!root) return;
-    if (root.nodeType === 1 && isTranslationNode(root)) return;
+    if (root.nodeType === 1 && (isTranslationNode(root) || PRUNE_TAG_REGEX.test(root.tagName))) return;
 
     if (root.nodeType === 1) {
       if (
@@ -889,26 +1018,41 @@
 
   /**
    * 特例二：針對含有跨域樣式表的頁面，在主執行緒空閒時進行計算樣式抽樣修補
-   * 採用「兩階段讀寫分離（Batch Read -> Batch Write）」，消除迴圈內讀寫交錯造成的強制同步重排 (Style Thrashing)
+   * 採用「4ms 時間切片 + 增量佇列 + 兩階段讀寫分離（Batch Read -> Batch Write）」，徹底消除同步長任務與 Style Thrashing
+   * @param {IdleDeadline} [deadline] 瀏覽器傳入之 IdleDeadline 物件
    */
-  function patchComputedStyles() {
+  function patchComputedStyles(deadline) {
     if (typeof document === 'undefined' || typeof window === 'undefined') return;
 
-    // 涵蓋全階層標題 (h1-h6)、文章卡片、標題容器、連結、內文、代碼塊與文章後設資料 (日期、作者、時間標籤)
-    const sampleTargets = document.querySelectorAll(
-      'h1, h2, h3, h4, h5, h6, [class*="title"], [class*="heading"], [class*="card"] a, [class*="post"] a, main, article, section, header, p, code, pre, [class*="content"], [class*="editor"], time, [class*="date"], [class*="meta"], [class*="author"], [class*="byline"], [class*="time"], [class*="published"]'
-    );
+    // 若佇列已消化完畢或尚未初始化，初次建立候選目標清單
+    if (computedCandidates.length === 0 || computedCursor >= computedCandidates.length) {
+      const sampleTargets = document.querySelectorAll(
+        'h1, h2, h3, h4, h5, h6, [class*="title"], [class*="heading"], [class*="card"] a, [class*="post"] a, main, article, section, header, p, code, pre, [class*="content"], [class*="editor"], time, [class*="date"], [class*="meta"], [class*="author"], [class*="byline"], [class*="time"], [class*="published"]'
+      );
+      computedCandidates = Array.from(sampleTargets);
+      computedCursor = 0;
+    }
 
-    const totalLen = sampleTargets.length;
-    let sampledCount = 0;
+    const totalLen = computedCandidates.length;
     const pendingWrites = [];
+    const isSliceMode = Boolean(deadline || isIdlePatchScheduled);
+    const sliceStart = typeof performance !== 'undefined' && performance.now ? performance.now() : Date.now();
 
-    // 第一階段（Batch Read）：純讀取 getComputedStyle 並收集待修補節點，期間零 DOM 樣式寫入
-    for (let i = 0; i < totalLen && sampledCount < 500; i++) {
-      const el = sampleTargets[i];
+    // 第一階段（Batch Read）：純讀取 getComputedStyle 並收集待修補節點
+    while (computedCursor < totalLen) {
+      // 僅在排程切片模式下進行時間片預算檢查 (4ms)
+      if (isSliceMode) {
+        if (deadline && typeof deadline.timeRemaining === 'function') {
+          if (deadline.timeRemaining() <= 1.0) break;
+        } else {
+          const now = typeof performance !== 'undefined' && performance.now ? performance.now() : Date.now();
+          if (now - sliceStart >= SLICE_BUDGET_MS) break;
+        }
+      }
+
+      const el = computedCandidates[computedCursor++];
       if (!el || processedElements.has(el)) continue;
       processedElements.add(el);
-      sampledCount++;
 
       try {
         const computed = window.getComputedStyle(el);
@@ -972,6 +1116,14 @@
         setStylePropertyInternal(item.el.style, 'font-family', item.targetFont, 'important');
       }
     }
+
+    // 自動續排：若本輪切片時間用盡但佇列尚未消化完畢，自動排程下一次空閒批次推進
+    if (computedCursor < computedCandidates.length) {
+      scheduleIdleComputedStylePatch();
+    } else {
+      computedCandidates = [];
+      computedCursor = 0;
+    }
   }
 
   /**
@@ -981,15 +1133,15 @@
     if (!hasCorsSheets || isIdlePatchScheduled || typeof window === 'undefined') return;
     isIdlePatchScheduled = true;
 
-    const runner = () => {
+    const runner = (deadline) => {
       isIdlePatchScheduled = false;
-      patchComputedStyles();
+      patchComputedStyles(deadline);
     };
 
     if (typeof window !== 'undefined' && typeof window.requestIdleCallback === 'function') {
       window.requestIdleCallback(runner, { timeout: 1500 });
     } else if (typeof setTimeout === 'function') {
-      setTimeout(runner, 120);
+      setTimeout(runner, 60);
     } else {
       runner();
     }
@@ -1041,9 +1193,10 @@
    * 特例五：攔截 Element.prototype.attachShadow 支援 Web Components
    */
   function hookShadowDOM() {
-    if (typeof Element === 'undefined' || !Element.prototype || !Element.prototype.attachShadow) {
+    if (isShadowDOMHooked || typeof Element === 'undefined' || !Element.prototype || !Element.prototype.attachShadow) {
       return;
     }
+    isShadowDOMHooked = true;
 
     const originalAttachShadow = Element.prototype.attachShadow;
     Element.prototype.attachShadow = function(initOptions) {
@@ -1056,8 +1209,8 @@
   }
 
   /**
-   * 原型鏈 API 攔截層：攔截動態 insertRule, replaceSync 與 CSSStyleDeclaration.setProperty
-   * 確保 CSS-in-JS 與動態腳本產生的字型樣式第一時間被前置
+   * 原型鏈 API 攔截層：攔截動態 insertRule, replaceSync, replace 與 CSSStyleDeclaration.setProperty
+   * 確保 CSS-in-JS 與動態腳本產生的字型樣式第一時間被前置（以 _fpHooked 標記防止重複包裝）
    */
   function hookCSSPrototypes() {
     // 0. 攔截 HTMLElement.prototype.style getter 以建立 style 物件與 DOM 元素的弱引用關聯
@@ -1067,16 +1220,18 @@
                     (typeof Element !== 'undefined' && Element.prototype);
       if (proto) {
         const desc = Object.getOwnPropertyDescriptor(proto, 'style');
-        if (desc && desc.get) {
+        if (desc && desc.get && !desc.get._fpHooked) {
           const origStyleGet = desc.get;
+          const hookedStyleGet = function() {
+            const s = origStyleGet.call(this);
+            if (s && typeof s === 'object' && !styleToElementMap.has(s)) {
+              styleToElementMap.set(s, this);
+            }
+            return s;
+          };
+          hookedStyleGet._fpHooked = true;
           Object.defineProperty(proto, 'style', {
-            get: function() {
-              const s = origStyleGet.call(this);
-              if (s && typeof s === 'object') {
-                styleToElementMap.set(s, this);
-              }
-              return s;
-            },
+            get: hookedStyleGet,
             configurable: true,
             enumerable: true
           });
@@ -1090,14 +1245,18 @@
     try {
       if (typeof CSSStyleDeclaration !== 'undefined' && CSSStyleDeclaration.prototype.setProperty) {
         const origSetProperty = CSSStyleDeclaration.prototype.setProperty;
-        CSSStyleDeclaration.prototype.setProperty = function(prop, val, priority) {
-          if (!isInternalStyleWrite && prop === 'font-family' && typeof val === 'string' && val) {
-            const selectorContext = getStyleContextSelector(this);
-            const prepended = prependFontFamily(val, selectorContext);
-            if (prepended) val = prepended;
-          }
-          return origSetProperty.call(this, prop, val, priority);
-        };
+        if (!origSetProperty._fpHooked) {
+          const hookedSetProperty = function(prop, val, priority) {
+            if (!isInternalStyleWrite && prop === 'font-family' && typeof val === 'string' && val) {
+              const selectorContext = getStyleContextSelector(this);
+              const prepended = prependFontFamily(val, selectorContext);
+              if (prepended) val = prepended;
+            }
+            return origSetProperty.call(this, prop, val, priority);
+          };
+          hookedSetProperty._fpHooked = true;
+          CSSStyleDeclaration.prototype.setProperty = hookedSetProperty;
+        }
       }
     } catch {
       // 容錯防禦
@@ -1122,18 +1281,20 @@
 
       if (styleProto) {
         const desc = Object.getOwnPropertyDescriptor(styleProto, 'fontFamily');
-        if (desc && desc.set) {
+        if (desc && desc.set && !desc.set._fpHooked) {
           const origSet = desc.set;
+          const hookedSet = function(val) {
+            if (!isInternalStyleWrite && typeof val === 'string' && val) {
+              const selectorContext = getStyleContextSelector(this);
+              const prepended = prependFontFamily(val, selectorContext);
+              if (prepended) val = prepended;
+            }
+            return origSet.call(this, val);
+          };
+          hookedSet._fpHooked = true;
           Object.defineProperty(styleProto, 'fontFamily', {
             get: desc.get,
-            set: function(val) {
-              if (!isInternalStyleWrite && typeof val === 'string' && val) {
-                const selectorContext = getStyleContextSelector(this);
-                const prepended = prependFontFamily(val, selectorContext);
-                if (prepended) val = prepended;
-              }
-              return origSet.call(this, val);
-            },
+            set: hookedSet,
             configurable: true,
             enumerable: true
           });
@@ -1147,16 +1308,20 @@
     try {
       if (typeof CSSStyleSheet !== 'undefined' && CSSStyleSheet.prototype.insertRule) {
         const origInsertRule = CSSStyleSheet.prototype.insertRule;
-        CSSStyleSheet.prototype.insertRule = function(ruleText, index) {
-          if (typeof ruleText === 'string' && ruleText.includes('font-family')) {
-            try {
-              ruleText = rewriteCssContent(ruleText);
-            } catch {
-              // 容錯防禦
+        if (!origInsertRule._fpHooked) {
+          const hookedInsert = function(ruleText, index) {
+            if (typeof ruleText === 'string' && ruleText.includes('font-family')) {
+              try {
+                ruleText = rewriteCssContent(ruleText);
+              } catch {
+                // 容錯防禦
+              }
             }
-          }
-          return origInsertRule.call(this, ruleText, index);
-        };
+            return origInsertRule.call(this, ruleText, index);
+          };
+          hookedInsert._fpHooked = true;
+          CSSStyleSheet.prototype.insertRule = hookedInsert;
+        }
       }
     } catch {
       // 容錯防禦
@@ -1166,16 +1331,20 @@
     try {
       if (typeof CSSStyleSheet !== 'undefined' && CSSStyleSheet.prototype.replaceSync) {
         const origReplaceSync = CSSStyleSheet.prototype.replaceSync;
-        CSSStyleSheet.prototype.replaceSync = function(text) {
-          if (typeof text === 'string' && text.includes('font-family')) {
-            try {
-              text = rewriteCssContent(text);
-            } catch {
-              // 容錯防禦
+        if (!origReplaceSync._fpHooked) {
+          const hookedSync = function(text) {
+            if (typeof text === 'string' && text.includes('font-family')) {
+              try {
+                text = rewriteCssContent(text);
+              } catch {
+                // 容錯防禦
+              }
             }
-          }
-          return origReplaceSync.call(this, text);
-        };
+            return origReplaceSync.call(this, text);
+          };
+          hookedSync._fpHooked = true;
+          CSSStyleSheet.prototype.replaceSync = hookedSync;
+        }
       }
     } catch {
       // 容錯防禦
@@ -1185,16 +1354,20 @@
     try {
       if (typeof CSSStyleSheet !== 'undefined' && CSSStyleSheet.prototype.replace) {
         const origReplace = CSSStyleSheet.prototype.replace;
-        CSSStyleSheet.prototype.replace = function(text) {
-          if (typeof text === 'string' && text.includes('font-family')) {
-            try {
-              text = rewriteCssContent(text);
-            } catch {
-              // 容錯防禦
+        if (!origReplace._fpHooked) {
+          const hookedAsync = function(text) {
+            if (typeof text === 'string' && text.includes('font-family')) {
+              try {
+                text = rewriteCssContent(text);
+              } catch {
+                // 容錯防禦
+              }
             }
-          }
-          return origReplace.call(this, text);
-        };
+            return origReplace.call(this, text);
+          };
+          hookedAsync._fpHooked = true;
+          CSSStyleSheet.prototype.replace = hookedAsync;
+        }
       }
     } catch {
       // 容錯防禦
@@ -1202,10 +1375,15 @@
   }
 
   /**
-   * 監聽樣式表動態插入與載入事件、行內樣式屬性變更
+   * 監聽樣式表動態插入與載入事件、行內樣式屬性變更（整合單次遍歷、祖先去重與屬性變更合併）
    * @param {Document|ShadowRoot} targetDoc 目標文件或根節點
    */
   function observeStyleSheets(targetDoc = document) {
+    if (observedRoots.has(targetDoc)) {
+      return;
+    }
+    observedRoots.add(targetDoc);
+
     const targetNode = targetDoc.documentElement || targetDoc;
     if (!targetNode || typeof MutationObserver === 'undefined') {
       return;
@@ -1214,74 +1392,135 @@
     const observer = new MutationObserver((mutations) => {
       let shouldScanStylesheets = false;
       let hasAddedElements = false;
+      const modifiedStyleTargets = new Set();
+      const rawAddedElements = [];
 
-      for (let i = 0; i < mutations.length; i++) {
+      const mutLen = mutations.length;
+      for (let i = 0; i < mutLen; i++) {
         const mutation = mutations[i];
 
-        // 1. 監聽行內 style 屬性動態變更
+        // 1. 收集行內 style 屬性動態變更（以 Set 合併同一批次的重複目標）
         if (mutation.type === 'attributes' && mutation.attributeName === 'style') {
-          if (isTranslationNode(mutation.target)) continue;
-          patchElementInlineStyle(mutation.target);
+          const targetEl = mutation.target;
+          if (!isInternalStyleWrite && targetEl && !isTranslationNode(targetEl)) {
+            modifiedStyleTargets.add(targetEl);
+          }
         } else if (mutation.type === 'childList') {
           const added = mutation.addedNodes;
           const addedLen = added.length;
           for (let j = 0; j < addedLen; j++) {
             const node = added[j];
-            if (!node || node.nodeType !== 1) continue;
-            if (isTranslationNode(node)) continue;
-            const tagName = node.tagName;
+            if (node && node.nodeType === 1 && !isTranslationNode(node)) {
+              rawAddedElements.push(node);
+            }
+          }
+        }
+      }
 
-            if (node.shadowRoot) {
-              processShadowRoot(node.shadowRoot);
+      // 執行屬性變更批次處理（每元素保證僅執行一次樣式檢查）
+      if (modifiedStyleTargets.size > 0) {
+        modifiedStyleTargets.forEach((el) => {
+          patchElementInlineStyle(el);
+        });
+      }
+
+      // 2. 處理新增節點（祖先去重與單次整合遍歷）
+      if (rawAddedElements.length > 0) {
+        hasAddedElements = true;
+        const isDocLoading = (targetDoc.ownerDocument || targetDoc).readyState === 'loading';
+
+        let topRoots = rawAddedElements;
+        if (rawAddedElements.length > 1) {
+          const batchSet = new Set(rawAddedElements);
+          topRoots = [];
+          for (let i = 0; i < rawAddedElements.length; i++) {
+            const node = rawAddedElements[i];
+            let parent = node.parentNode;
+            if (!parent) {
+              topRoots.push(node);
+              continue;
+            }
+            let hasAncestorInBatch = false;
+            while (parent) {
+              if (batchSet.has(parent)) {
+                hasAncestorInBatch = true;
+                break;
+              }
+              parent = parent.parentNode;
+            }
+            if (!hasAncestorInBatch) {
+              topRoots.push(node);
+            }
+          }
+        }
+
+        const topLen = topRoots.length;
+        for (let i = 0; i < topLen; i++) {
+          const node = topRoots[i];
+          const tagName = node.tagName;
+
+          // 剪枝特徵：跳過純腳本、向量圖與非排版標籤
+          if (PRUNE_TAG_REGEX.test(tagName)) {
+            continue;
+          }
+
+          if (node.shadowRoot) {
+            processShadowRoot(node.shadowRoot);
+          }
+
+          if (tagName === 'STYLE' || tagName === 'style') {
+            if (node.sheet) {
+              processStyleSheet(node.sheet);
+            } else {
+              shouldScanStylesheets = true;
+            }
+          } else if ((tagName === 'LINK' || tagName === 'link') && node.rel === 'stylesheet') {
+            if (node.sheet) {
+              processStyleSheet(node.sheet);
+            } else if (typeof node.addEventListener === 'function') {
+              node.addEventListener('load', () => {
+                if (node.sheet) processStyleSheet(node.sheet);
+              }, { once: true });
+            }
+          } else {
+            // 首屏 HTML 解析期：原生串流解析器會逐一派發節點，僅做 O(1) 自身單節點行內樣式檢查
+            if (
+              (typeof node.hasAttribute !== 'function' || node.hasAttribute('style')) &&
+              node.style &&
+              typeof node.style.getPropertyValue === 'function' &&
+              node.style.getPropertyValue('font-family')
+            ) {
+              patchElementInlineStyle(node);
             }
 
-            if (tagName === 'STYLE' || tagName === 'style') {
-              if (node.sheet) {
-                processStyleSheet(node.sheet);
-              } else {
-                shouldScanStylesheets = true;
-              }
-            } else if ((tagName === 'LINK' || tagName === 'link') && node.rel === 'stylesheet') {
-              if (node.sheet) {
-                processStyleSheet(node.sheet);
-              } else if (typeof node.addEventListener === 'function') {
-                node.addEventListener('load', () => {
-                  if (node.sheet) processStyleSheet(node.sheet);
-                }, { once: true });
-              }
-            } else {
-              hasAddedElements = true;
-              const isDocLoading = (targetDoc.ownerDocument || targetDoc).readyState === 'loading';
-              if (isDocLoading) {
-                // 首屏 HTML 解析期：原生串流解析器會逐一派發節點，僅做 O(1) 自身單節點行內樣式檢查，避免子樹重複遍歷
-                if (
-                  (typeof node.hasAttribute !== 'function' || node.hasAttribute('style')) &&
-                  node.style &&
-                  typeof node.style.getPropertyValue === 'function' &&
-                  node.style.getPropertyValue('font-family')
-                ) {
-                  patchElementInlineStyle(node);
-                }
-              } else {
-                // 互動期（SPA 動態渲染）：增量掃描新增之局部子樹（葉節點 O(1) 短路，容器子樹 O(ΔN)）
-                scanAndPatchInlineStyles(node);
-                scanAndPatchShadowRoots(node);
-                if (node.firstElementChild && typeof node.querySelectorAll === 'function') {
-                  const nestedStyles = node.querySelectorAll('style, link[rel="stylesheet"]');
-                  const nestedLen = nestedStyles.length;
-                  for (let k = 0; k < nestedLen; k++) {
-                    const styleNode = nestedStyles[k];
-                    if (styleNode.sheet) {
-                      processStyleSheet(styleNode.sheet);
-                    } else if ((styleNode.tagName === 'LINK' || styleNode.tagName === 'link') && typeof styleNode.addEventListener === 'function') {
-                      styleNode.addEventListener('load', () => {
-                        if (styleNode.sheet) processStyleSheet(styleNode.sheet);
-                      }, { once: true });
+            // 互動期（SPA 動態渲染）：以單次 querySelectorAll 取代原先 3 次獨立子樹遍歷
+            if (!isDocLoading && node.firstElementChild && typeof node.querySelectorAll === 'function') {
+              try {
+                const subItems = node.querySelectorAll('[style*="font-family" i], style, link[rel="stylesheet"]');
+                const subLen = subItems.length;
+                for (let k = 0; k < subLen; k++) {
+                  const subNode = subItems[k];
+                  const subTag = subNode.tagName;
+                  if (subTag === 'STYLE' || subTag === 'style') {
+                    if (subNode.sheet) {
+                      processStyleSheet(subNode.sheet);
                     } else {
                       shouldScanStylesheets = true;
                     }
+                  } else if ((subTag === 'LINK' || subTag === 'link') && subNode.rel === 'stylesheet') {
+                    if (subNode.sheet) {
+                      processStyleSheet(subNode.sheet);
+                    } else if (typeof subNode.addEventListener === 'function') {
+                      subNode.addEventListener('load', () => {
+                        if (subNode.sheet) processStyleSheet(subNode.sheet);
+                      }, { once: true });
+                    }
+                  } else {
+                    patchElementInlineStyle(subNode);
                   }
                 }
+              } catch {
+                // 容錯防禦
               }
             }
           }
@@ -1306,7 +1545,11 @@
 
   // --- 初始化流程 ---
   function init() {
-    if (typeof document === 'undefined') return;
+    if (typeof document === 'undefined' || isInitialized) return;
+    isInitialized = true;
+
+    // 0. 初始化共用 Constructable Stylesheets
+    initSharedConstructableStyles();
 
     // 1. 原型鏈深度攔截
     hookCSSPrototypes();
@@ -1365,7 +1608,16 @@
       MONO_PREPEND_STR,
       BASE_SANS_STACK,
       BASE_MONO_STACK,
+      MAX_CACHE_SIZE,
+      SLICE_BUDGET_MS,
+      PRUNE_TAG_REGEX,
+      SKIP_FETCH_HOST_REGEX,
+      MAX_FETCH_BYTES,
+      fontCache,
+      neutralFontCache,
+      selectorStateCache,
       processedStyleSheets,
+      observedRoots,
       isIconFont,
       isMonospace,
       isAlreadyPrepended,
@@ -1386,6 +1638,10 @@
       scanAndPatchShadowRoots,
       hookCSSPrototypes,
       observeStyleSheets,
+      initSharedConstructableStyles,
+      getSharedBaseSheet: () => sharedBaseSheet,
+      getSharedEditorSheet: () => sharedEditorSheet,
+      getIsInitialized: () => isInitialized,
       init
     };
   }

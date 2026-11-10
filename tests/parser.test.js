@@ -21,6 +21,9 @@ const {
   isIconFont,
   isMonospace,
   isAlreadyPrepended,
+  fontCache,
+  neutralFontCache,
+  MAX_CACHE_SIZE,
   SANS_PREPEND_STR,
   MONO_PREPEND_STR
 } = loadUserscript();
@@ -210,6 +213,29 @@ describe('字型堆疊解析與前置引擎 (Font Stack Parser & Prepender)', ()
       expect(rewritten).toContain("font-family: 'CustomFont';");
       expect(rewritten).toContain('font-family: "My Icon Font";');
       expect(rewritten).toContain(`font-family: ${SANS_PREPEND_STR}'CustomFont', sans-serif;`);
+    });
+  });
+
+  // Issue #1 & #3: 快取 FIFO 淘汰機制
+  describe('6. 快取 FIFO 淘汰與有界限記憶體防護 (Issue #1 & #3)', () => {
+    it('快取達到上限時應採用 FIFO 淘汰最舊項目，而非全量清空 (Preserve Warm Cache)', () => {
+      neutralFontCache.clear();
+      expect(neutralFontCache.size).toBe(0);
+
+      // 填入 1,000 筆獨立字型
+      for (let i = 0; i < MAX_CACHE_SIZE; i++) {
+        prependFontFamily(`"FontUnique-${i}", sans-serif`);
+      }
+      expect(neutralFontCache.size).toBe(MAX_CACHE_SIZE);
+      expect(neutralFontCache.has('"FontUnique-0", sans-serif')).toBe(true);
+      expect(neutralFontCache.has('"FontUnique-999", sans-serif')).toBe(true);
+
+      // 再新增第 1,001 筆，應淘汰第 0 筆，而第 1~999 筆熱點快取依然保留
+      prependFontFamily('"FontUnique-1000", sans-serif');
+      expect(neutralFontCache.size).toBe(MAX_CACHE_SIZE);
+      expect(neutralFontCache.has('"FontUnique-0", sans-serif')).toBe(false); // 第 0 筆被淘汰
+      expect(neutralFontCache.has('"FontUnique-1", sans-serif')).toBe(true);  // 第 1 筆依然存在
+      expect(neutralFontCache.has('"FontUnique-1000", sans-serif')).toBe(true);
     });
   });
 });

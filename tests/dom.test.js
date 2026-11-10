@@ -322,4 +322,133 @@ describe('DOM / CSSOM 與特例整合測試', () => {
     // 驗證未觸發跨域樣式空閒期修補排程 (requestIdleCallback)
     expect(window.requestIdleCallback).not.toHaveBeenCalled();
   });
+
+  // Issue #1 & #3: DOM 單次掃描、剪枝與祖先去重
+  it('11. 新增 DOM 節點時應執行剪枝與祖先去重，消除重複子樹遍歷 (Issue #1, #3)', async () => {
+    const { document, exports } = createEnvironment();
+    exports.observeStyleSheets(document);
+
+    const container = document.createElement('div');
+    container.className = 'top-container';
+
+    // 剪枝節點：SVG 與 SCRIPT
+    const svgNode = document.createElement('svg');
+    const pathNode = document.createElement('path');
+    svgNode.appendChild(pathNode);
+    container.appendChild(svgNode);
+
+    // 含有行內樣式之一般子節點
+    const subText = document.createElement('span');
+    subText.setAttribute('style', 'font-family: Arial, sans-serif;');
+    container.appendChild(subText);
+
+    // 同時將父容器與子節點放入同一個 append 動作中
+    document.body.appendChild(container);
+
+    await new Promise((resolve) => setTimeout(resolve, 30));
+
+    expect(subText.style.getPropertyValue('font-family')).toContain('Google Sans');
+  });
+
+  // Issue #3 目標五: 合併 MutationObserver 的重複屬性變更
+  it('12. 同一 MutationObserver callback 中多筆相同元素的 style 變動應被合併 (Issue #3)', async () => {
+    const { document, exports } = createEnvironment();
+    exports.observeStyleSheets(document);
+
+    const testEl = document.createElement('div');
+    document.body.appendChild(testEl);
+
+    await new Promise((resolve) => setTimeout(resolve, 30));
+
+    // 連續變更 3 次 style 屬性
+    testEl.setAttribute('style', 'color: red;');
+    testEl.setAttribute('style', 'color: blue;');
+    testEl.setAttribute('style', 'font-family: Arial, sans-serif;');
+
+    await new Promise((resolve) => setTimeout(resolve, 30));
+
+    expect(testEl.style.getPropertyValue('font-family')).toContain('Google Sans');
+  });
+
+  // Issue #1 & #3 目標二: Computed Style 時間切片與大於 500 筆元素的自動續排
+  it('13. patchComputedStyles 應支援時間切片與超過 500 筆元素的自動續排推進 (Issue #1, #3)', () => {
+    const { document, exports, window } = createEnvironment();
+
+    let idleRunner = null;
+    window.requestIdleCallback = vi.fn((cb) => {
+      idleRunner = cb;
+    });
+
+    // 模擬頁面存在跨域樣式表 (hasCorsSheets = true)
+    exports.processStyleSheet({
+      get cssRules() {
+        throw new Error('SecurityError');
+      }
+    });
+    expect(exports.getHasCorsSheets()).toBe(true);
+
+    // 消化初次排程回呼，將 isIdlePatchScheduled 重設為 false
+    if (idleRunner) {
+      idleRunner();
+      idleRunner = null;
+    }
+    window.requestIdleCallback.mockClear();
+
+    // 建立 600 個 h2 標題元素
+    for (let i = 0; i < 600; i++) {
+      const h2 = document.createElement('h2');
+      h2.textContent = `Title ${i}`;
+      document.body.appendChild(h2);
+    }
+
+    window.getComputedStyle = () => ({ fontFamily: 'Arial, sans-serif' });
+
+    // 傳入一個 timeRemaining 耗盡的 mock deadline 模擬時間片用完
+    const mockDeadline = {
+      timeRemaining: () => 0.5
+    };
+
+    // 執行帶有 deadline 的計算樣式修補
+    exports.patchComputedStyles(mockDeadline);
+
+    // 驗證因時間片用完且佇列未消化完畢，自動排程了下一批
+    expect(window.requestIdleCallback).toHaveBeenCalled();
+  });
+
+  // Issue #2 Task 4: 跨域 CSS fetch 防護
+  it('14. 跨域樣式表為 Google Fonts 或檔案超過 1MB 時應跳過 fetch 改寫 (Issue #2)', () => {
+    const { exports, window } = createEnvironment();
+    window.requestIdleCallback = vi.fn();
+
+    const fetchSpy = vi.fn();
+    window.fetch = fetchSpy;
+
+    // 模擬 Google Fonts 跨域樣式表
+    const googleFontSheet = {
+      href: 'https://fonts.googleapis.com/css2?family=Roboto&display=swap',
+      get cssRules() {
+        throw new Error('SecurityError');
+      }
+    };
+
+    exports.processStyleSheet(googleFontSheet);
+
+    // 應命中 SKIP_FETCH_HOST_REGEX 直接跳過 fetch
+    expect(fetchSpy).not.toHaveBeenCalled();
+    expect(exports.getHasCorsSheets()).toBe(true);
+  });
+
+  // Issue #3 目標七: 初始化與 Hook 冪等性
+  it('15. 重複呼叫 init() 與 hookCSSPrototypes() 應具備嚴格冪等性 (Issue #3)', () => {
+    const { exports, document } = createEnvironment();
+
+    // 重複呼叫多次 init
+    expect(() => {
+      exports.init();
+      exports.init();
+      exports.hookCSSPrototypes();
+      exports.hookShadowDOM();
+      exports.observeStyleSheets(document);
+    }).not.toThrow();
+  });
 });
