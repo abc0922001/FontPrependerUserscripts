@@ -3,14 +3,18 @@ import { JSDOM } from 'jsdom';
 import fs from 'node:fs';
 import vm from 'node:vm';
 
-function createEnvironment(html = '<!DOCTYPE html><html><head></head><body></body></html>') {
+function createEnvironment(html = '<!DOCTYPE html><html><head></head><body></body></html>', beforeInit) {
   const dom = new JSDOM(html, {
     url: 'https://example.com/',
     runScripts: 'dangerously'
   });
 
   const { window } = dom;
-  const { document, Element, MutationObserver } = window;
+  const { document, Element, HTMLElement, MutationObserver, CSSStyleSheet, CSSStyleDeclaration } = window;
+
+  if (typeof beforeInit === 'function') {
+    beforeInit(window, document);
+  }
 
   const code = fs.readFileSync(new URL('../src/FontPrepender.user.js', import.meta.url), 'utf8');
   const module = { exports: {} };
@@ -19,7 +23,10 @@ function createEnvironment(html = '<!DOCTYPE html><html><head></head><body></bod
     window,
     document,
     Element,
+    HTMLElement,
     MutationObserver,
+    CSSStyleSheet,
+    CSSStyleDeclaration,
     setTimeout,
     clearTimeout,
     console,
@@ -54,6 +61,11 @@ describe('DOM / CSSOM 與特例整合測試', () => {
     // 測試重複注入冪等性
     exports.injectBaseStyles(document);
     expect(document.querySelectorAll('#font-prepender-base-style').length).toBe(1);
+
+    // 驗證已將自身樣式表加入 processedStyleSheets 避免重複掃描
+    if (baseStyle.sheet) {
+      expect(exports.processedStyleSheets.has(baseStyle.sheet)).toBe(true);
+    }
   });
 
   it('2. 應正確掃描並就地改寫 CSSOM 規則中的 font-family', () => {
@@ -99,8 +111,45 @@ describe('DOM / CSSOM 與特例整合測試', () => {
     expect(innerRule.style.getPropertyValue('font-family')).toContain('Google Sans');
   });
 
-  it('4. 跨域樣式表 (CORS) 存取拋出 SecurityError 時應安全捕捉並不崩潰', () => {
+  it('3.1 應遞迴處理 @import 匯入之子樣式表 (CSSImportRule)', () => {
     const { exports } = createEnvironment();
+
+    let childFont = 'sans-serif';
+    const mockChildSheet = {
+      cssRules: [
+        {
+          selectorText: '.imported-title',
+          style: {
+            getPropertyValue: (prop) => (prop === 'font-family' ? childFont : ''),
+            getPropertyPriority: () => '',
+            setProperty: (prop, val) => {
+              if (prop === 'font-family') childFont = val;
+            },
+            length: 0
+          }
+        }
+      ]
+    };
+
+    const mockParentRules = [
+      {
+        styleSheet: mockChildSheet
+      }
+    ];
+
+    exports.processRules(mockParentRules);
+    expect(childFont).toContain('Google Sans');
+  });
+
+  it('4. 跨域樣式表 (CORS) 存取拋出 SecurityError 時應安全捕捉並不崩潰，且以 hasCorsSheets 閘門控制排程', () => {
+    const { exports, window } = createEnvironment();
+
+    expect(exports.getHasCorsSheets()).toBe(false);
+
+    // 在無跨域樣式表下呼叫 scheduleIdleComputedStylePatch 應被閘門短路攔截
+    window.requestIdleCallback = vi.fn();
+    exports.scheduleIdleComputedStylePatch();
+    expect(window.requestIdleCallback).not.toHaveBeenCalled();
 
     const mockCorsSheet = {
       get cssRules() {
@@ -111,6 +160,8 @@ describe('DOM / CSSOM 與特例整合測試', () => {
     expect(() => {
       exports.processStyleSheet(mockCorsSheet);
     }).not.toThrow();
+
+    expect(exports.getHasCorsSheets()).toBe(true);
   });
 
   it('5. 應攔截 Element.prototype.attachShadow 並為 open 模式 ShadowRoot 掛載基礎樣式', () => {
@@ -126,6 +177,30 @@ describe('DOM / CSSOM 與特例整合測試', () => {
     const shadowBaseStyle = shadowRoot.querySelector('#font-prepender-base-style');
     expect(shadowBaseStyle).not.toBeNull();
     expect(shadowBaseStyle.textContent).toContain('Google Sans');
+  });
+
+  it('5.1 應穿透掃描既有與 Declarative Shadow DOM (scanAndPatchShadowRoots)', () => {
+    let capturedShadowRoot = null;
+    const { document, exports } = createEnvironment('<!DOCTYPE html><html><head></head><body></body></html>', (win, doc) => {
+      const customHost = doc.createElement('custom-card');
+      doc.body.appendChild(customHost);
+      capturedShadowRoot = customHost.attachShadow({ mode: 'open' });
+      const p = doc.createElement('p');
+      p.className = 'shadow-desc';
+      p.style.fontFamily = 'Arial, sans-serif';
+      p.textContent = 'Shadow Content';
+      capturedShadowRoot.appendChild(p);
+    });
+
+    // 呼叫穿透掃描
+    exports.scanAndPatchShadowRoots(document);
+
+    const baseStyle = capturedShadowRoot.querySelector('#font-prepender-base-style');
+    expect(baseStyle).not.toBeNull();
+    expect(baseStyle.textContent).toContain('Google Sans');
+
+    const p = capturedShadowRoot.querySelector('.shadow-desc');
+    expect(p.style.getPropertyValue('font-family')).toContain('Google Sans');
   });
 
   it('6. 應支援 adoptedStyleSheets 樣式表改寫', () => {
@@ -156,7 +231,228 @@ describe('DOM / CSSOM 與特例整合測試', () => {
     );
   });
 
-  it('7. 應於 <head> 注入 Google Fonts 線上樣式表並維持冪等性與略過保護', () => {
+  it('7. 應攔截 CSSStyleSheet.prototype.replace 非同步方法並改寫字型宣告', async () => {
+    const { window, exports } = createEnvironment();
+    let capturedText = '';
+    window.CSSStyleSheet.prototype.replace = function(text) {
+      capturedText = text;
+      return Promise.resolve(this);
+    };
+
+    exports.hookCSSPrototypes();
+
+    const sheet = Object.create(window.CSSStyleSheet.prototype);
+    await sheet.replace('.async-card { font-family: Arial, sans-serif; } pre.code { font-family: sans-serif; }');
+
+    expect(capturedText).toContain(`font-family: ${exports.SANS_PREPEND_STR}Arial, sans-serif`);
+    expect(capturedText).toContain(`font-family: ${exports.MONO_PREPEND_STR}sans-serif`);
+  });
+
+  it('8. 原型鏈 setProperty 與 fontFamily setter 應能感知關聯元素之標籤與圖示上下文', () => {
+    const { document, exports } = createEnvironment();
+    exports.hookCSSPrototypes();
+
+    const codeEl = document.createElement('code');
+    document.body.appendChild(codeEl);
+    codeEl.style.fontFamily = 'var(--user-custom)';
+    expect(codeEl.style.getPropertyValue('font-family')).toContain('Intel One Mono');
+
+    const iconEl = document.createElement('i');
+    iconEl.className = 'fas';
+    document.body.appendChild(iconEl);
+    iconEl.style.setProperty('font-family', 'sans-serif');
+    expect(iconEl.style.getPropertyValue('font-family')).toBe('sans-serif');
+  });
+
+  // Issue #4: Chrome 內建整頁翻譯相容性防護
+  it('9. isTranslationNode 應精確識別 Chrome 整頁翻譯產生的純翻譯節點', () => {
+    const { document, exports } = createEnvironment();
+    const { isTranslationNode } = exports;
+
+    const fontEl = document.createElement('font');
+    fontEl.setAttribute('style', 'vertical-align: inherit;');
+    expect(isTranslationNode(fontEl)).toBe(true);
+
+    const normalDiv = document.createElement('div');
+    expect(isTranslationNode(normalDiv)).toBe(false);
+
+    // 若使用者或網站顯式指定了 font-family 於 <font> 上，不應視為純翻譯節點
+    const styledFont = document.createElement('font');
+    styledFont.style.fontFamily = 'Arial, sans-serif';
+    expect(isTranslationNode(styledFont)).toBe(false);
+  });
+
+  it('10. Chrome 整頁翻譯注入動態 <font> 節點時，不應誘發子樹重排、樣式覆寫或跨域計算修補排程 (Issue #4)', async () => {
+    const { document, exports, window } = createEnvironment('<!DOCTYPE html><html><head></head><body><p id="article-p"></p></body></html>');
+    window.requestIdleCallback = vi.fn();
+
+    // 模擬已存在跨域樣式表 (hasCorsSheets)
+    const mockCorsSheet = {
+      get cssRules() {
+        throw new Error('SecurityError');
+      }
+    };
+    exports.processStyleSheet(mockCorsSheet);
+    expect(exports.getHasCorsSheets()).toBe(true);
+
+    // 等待 JSDOM 首屏生命週期 (DOMContentLoaded / Load) 事件消化完畢
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    window.requestIdleCallback.mockClear();
+
+    const paragraph = document.getElementById('article-p');
+
+    // 模擬 Chrome 整頁翻譯：將段落內的英文 Text 替換為雙層 <font> 標籤
+    const outerFont = document.createElement('font');
+    outerFont.setAttribute('style', 'vertical-align: inherit;');
+    const innerFont = document.createElement('font');
+    innerFont.setAttribute('style', 'vertical-align: inherit;');
+    innerFont.textContent = '繁體中文翻譯文字';
+    outerFont.appendChild(innerFont);
+
+    // 監聽器應在 childList 與 attributes 監聽中忽略 translation nodes
+    paragraph.appendChild(outerFont);
+
+    // 等待 MutationObserver 非同步事件派發
+    await new Promise((resolve) => setTimeout(resolve, 30));
+
+    // 驗證未對 <font> 標籤寫入任何 font-family 內聯樣式
+    expect(outerFont.style.getPropertyValue('font-family')).toBe('');
+    expect(innerFont.style.getPropertyValue('font-family')).toBe('');
+
+    // 驗證未觸發跨域樣式空閒期修補排程 (requestIdleCallback)
+    expect(window.requestIdleCallback).not.toHaveBeenCalled();
+  });
+
+  // Issue #1 & #3: DOM 單次掃描、剪枝與祖先去重
+  it('11. 新增 DOM 節點時應執行剪枝與祖先去重，消除重複子樹遍歷 (Issue #1, #3)', async () => {
+    const { document, exports } = createEnvironment();
+    exports.observeStyleSheets(document);
+
+    const container = document.createElement('div');
+    container.className = 'top-container';
+
+    // 剪枝節點：SVG 與 SCRIPT
+    const svgNode = document.createElement('svg');
+    const pathNode = document.createElement('path');
+    svgNode.appendChild(pathNode);
+    container.appendChild(svgNode);
+
+    // 含有行內樣式之一般子節點
+    const subText = document.createElement('span');
+    subText.setAttribute('style', 'font-family: Arial, sans-serif;');
+    container.appendChild(subText);
+
+    // 同時將父容器與子節點放入同一個 append 動作中
+    document.body.appendChild(container);
+
+    await new Promise((resolve) => setTimeout(resolve, 30));
+
+    expect(subText.style.getPropertyValue('font-family')).toContain('Google Sans');
+  });
+
+  // Issue #3 目標五: 合併 MutationObserver 的重複屬性變更
+  it('12. 同一 MutationObserver callback 中多筆相同元素的 style 變動應被合併 (Issue #3)', async () => {
+    const { document, exports } = createEnvironment();
+    exports.observeStyleSheets(document);
+
+    const testEl = document.createElement('div');
+    document.body.appendChild(testEl);
+
+    await new Promise((resolve) => setTimeout(resolve, 30));
+
+    // 連續變更 3 次 style 屬性
+    testEl.setAttribute('style', 'color: red;');
+    testEl.setAttribute('style', 'color: blue;');
+    testEl.setAttribute('style', 'font-family: Arial, sans-serif;');
+
+    await new Promise((resolve) => setTimeout(resolve, 30));
+
+    expect(testEl.style.getPropertyValue('font-family')).toContain('Google Sans');
+  });
+
+  // Issue #1 & #3 目標二: Computed Style 時間切片與大於 500 筆元素的自動續排
+  it('13. patchComputedStyles 應支援時間切片與超過 500 筆元素的自動續排推進 (Issue #1, #3)', () => {
+    const { document, exports, window } = createEnvironment();
+
+    let idleRunner = null;
+    window.requestIdleCallback = vi.fn((cb) => {
+      idleRunner = cb;
+    });
+
+    // 模擬頁面存在跨域樣式表 (hasCorsSheets = true)
+    exports.processStyleSheet({
+      get cssRules() {
+        throw new Error('SecurityError');
+      }
+    });
+    expect(exports.getHasCorsSheets()).toBe(true);
+
+    // 消化初次排程回呼，將 isIdlePatchScheduled 重設為 false
+    if (idleRunner) {
+      idleRunner();
+      idleRunner = null;
+    }
+    window.requestIdleCallback.mockClear();
+
+    // 建立 600 個 h2 標題元素
+    for (let i = 0; i < 600; i++) {
+      const h2 = document.createElement('h2');
+      h2.textContent = `Title ${i}`;
+      document.body.appendChild(h2);
+    }
+
+    window.getComputedStyle = () => ({ fontFamily: 'Arial, sans-serif' });
+
+    // 傳入一個 timeRemaining 耗盡的 mock deadline 模擬時間片用完
+    const mockDeadline = {
+      timeRemaining: () => 0.5
+    };
+
+    // 執行帶有 deadline 的計算樣式修補
+    exports.patchComputedStyles(mockDeadline);
+
+    // 驗證因時間片用完且佇列未消化完畢，自動排程了下一批
+    expect(window.requestIdleCallback).toHaveBeenCalled();
+  });
+
+  // Issue #2 Task 4: 跨域 CSS fetch 防護
+  it('14. 跨域樣式表為 Google Fonts 或檔案超過 1MB 時應跳過 fetch 改寫 (Issue #2)', () => {
+    const { exports, window } = createEnvironment();
+    window.requestIdleCallback = vi.fn();
+
+    const fetchSpy = vi.fn();
+    window.fetch = fetchSpy;
+
+    // 模擬 Google Fonts 跨域樣式表
+    const googleFontSheet = {
+      href: 'https://fonts.googleapis.com/css2?family=Roboto&display=swap',
+      get cssRules() {
+        throw new Error('SecurityError');
+      }
+    };
+
+    exports.processStyleSheet(googleFontSheet);
+
+    // 應命中 SKIP_FETCH_HOST_REGEX 直接跳過 fetch
+    expect(fetchSpy).not.toHaveBeenCalled();
+    expect(exports.getHasCorsSheets()).toBe(true);
+  });
+
+  // Issue #3 目標七: 初始化與 Hook 冪等性
+  it('15. 重複呼叫 init() 與 hookCSSPrototypes() 應具備嚴格冪等性 (Issue #3)', () => {
+    const { exports, document } = createEnvironment();
+
+    // 重複呼叫多次 init
+    expect(() => {
+      exports.init();
+      exports.init();
+      exports.hookCSSPrototypes();
+      exports.hookShadowDOM();
+      exports.observeStyleSheets(document);
+    }).not.toThrow();
+  });
+
+  it('16. 應於 <head> 注入 Google Fonts 線上樣式表並維持冪等性與略過保護', () => {
     const { document, exports } = createEnvironment();
     exports.injectBaseStyles(document);
 

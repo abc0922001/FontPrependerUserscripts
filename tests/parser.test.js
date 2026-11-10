@@ -17,9 +17,13 @@ function loadUserscript(sandbox = {}) {
 
 const {
   prependFontFamily,
+  rewriteCssContent,
   isIconFont,
   isMonospace,
   isAlreadyPrepended,
+  fontCache,
+  neutralFontCache,
+  MAX_CACHE_SIZE,
   SANS_PREPEND_STR,
   MONO_PREPEND_STR
 } = loadUserscript();
@@ -111,12 +115,30 @@ describe('字型堆疊解析與前置引擎 (Font Stack Parser & Prepender)', ()
       const input = '"Font Awesome 6 Free", "FontAwesome"';
       expect(prependFontFamily(input)).toBe(input);
       expect(prependFontFamily('sans-serif', '.fa-icon')).toBe('sans-serif');
+      expect(prependFontFamily('sans-serif', 'i.fa')).toBe('sans-serif');
+      expect(prependFontFamily('sans-serif', '.fas')).toBe('sans-serif');
+      expect(prependFontFamily('sans-serif', '.far')).toBe('sans-serif');
+      expect(prependFontFamily('sans-serif', '.fab')).toBe('sans-serif');
+      expect(prependFontFamily('sans-serif', '.fal')).toBe('sans-serif');
+    });
+
+    it('不應誤將含有 fa 開頭之常規英文單字判定為圖示', () => {
+      expect(prependFontFamily('sans-serif', '.fade')).toContain('Google Sans');
+      expect(prependFontFamily('sans-serif', '.family-text')).toContain('Google Sans');
+      expect(prependFontFamily('sans-serif', '.fast-loading')).toContain('Google Sans');
     });
 
     it('命中 Material Icons、Codicon、IcoMoon 等圖示庫字型應原樣保留', () => {
       const iconStacks = [
         'Material Icons',
         'Material Symbols Outlined',
+        'mat-icon',
+        'gem-icon',
+        'lucide',
+        'remixicon',
+        'tabler',
+        'devicon',
+        'lumi',
         'codicon',
         'feather',
         'icomoon',
@@ -133,6 +155,8 @@ describe('字型堆疊解析與前置引擎 (Font Stack Parser & Prepender)', ()
     it('isIconFont 能正確辨識圖示特徵選擇器與字型名稱', () => {
       expect(isIconFont('.btn-icon', 'sans-serif')).toBe(true);
       expect(isIconFont('', 'Material-Icons')).toBe(true);
+      expect(isIconFont('.ri-search-line', 'sans-serif')).toBe(true);
+      expect(isIconFont('.ti-arrow-right', 'sans-serif')).toBe(true);
       expect(isIconFont('.normal-text', 'Arial, sans-serif')).toBe(false);
     });
   });
@@ -159,6 +183,59 @@ describe('字型堆疊解析與前置引擎 (Font Stack Parser & Prepender)', ()
 
       const monoVar = 'var(--font-mono)';
       expect(prependFontFamily(monoVar)).toBe(`${MONO_PREPEND_STR}${monoVar}`);
+    });
+
+    it('rewriteCssContent 應逆向提取選擇器上下文，保護圖示選擇器並將 pre/code 識別為等寬', () => {
+      const css = `
+        .fa-icon { font-family: sans-serif; }
+        pre.code-block { font-family: sans-serif !important; }
+        @media (min-width: 768px) { .article-body { font-family: Arial, sans-serif; } }
+      `;
+      const rewritten = rewriteCssContent(css);
+      expect(rewritten).toContain('.fa-icon { font-family: sans-serif; }');
+      expect(rewritten).toContain(`pre.code-block { font-family: ${MONO_PREPEND_STR}sans-serif !important; }`);
+      expect(rewritten).toContain(`.article-body { font-family: ${SANS_PREPEND_STR}Arial, sans-serif; }`);
+    });
+
+    it('rewriteCssContent 遇到 @font-face 規則應保持字型名稱定義不被改寫', () => {
+      const fontFaceCss = `
+        @font-face {
+          font-family: 'CustomFont';
+          src: url('custom.woff2') format('woff2');
+        }
+        @font-face {
+          font-family: "My Icon Font";
+          src: url('icons.woff') format('woff');
+        }
+        body { font-family: 'CustomFont', sans-serif; }
+      `;
+      const rewritten = rewriteCssContent(fontFaceCss);
+      expect(rewritten).toContain("font-family: 'CustomFont';");
+      expect(rewritten).toContain('font-family: "My Icon Font";');
+      expect(rewritten).toContain(`font-family: ${SANS_PREPEND_STR}'CustomFont', sans-serif;`);
+    });
+  });
+
+  // Issue #1 & #3: 快取 FIFO 淘汰機制
+  describe('6. 快取 FIFO 淘汰與有界限記憶體防護 (Issue #1 & #3)', () => {
+    it('快取達到上限時應採用 FIFO 淘汰最舊項目，而非全量清空 (Preserve Warm Cache)', () => {
+      neutralFontCache.clear();
+      expect(neutralFontCache.size).toBe(0);
+
+      // 填入 1,000 筆獨立字型
+      for (let i = 0; i < MAX_CACHE_SIZE; i++) {
+        prependFontFamily(`"FontUnique-${i}", sans-serif`);
+      }
+      expect(neutralFontCache.size).toBe(MAX_CACHE_SIZE);
+      expect(neutralFontCache.has('"FontUnique-0", sans-serif')).toBe(true);
+      expect(neutralFontCache.has('"FontUnique-999", sans-serif')).toBe(true);
+
+      // 再新增第 1,001 筆，應淘汰第 0 筆，而第 1~999 筆熱點快取依然保留
+      prependFontFamily('"FontUnique-1000", sans-serif');
+      expect(neutralFontCache.size).toBe(MAX_CACHE_SIZE);
+      expect(neutralFontCache.has('"FontUnique-0", sans-serif')).toBe(false); // 第 0 筆被淘汰
+      expect(neutralFontCache.has('"FontUnique-1", sans-serif')).toBe(true);  // 第 1 筆依然存在
+      expect(neutralFontCache.has('"FontUnique-1000", sans-serif')).toBe(true);
     });
   });
 });
