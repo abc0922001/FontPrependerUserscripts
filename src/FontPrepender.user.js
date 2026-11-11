@@ -2,7 +2,7 @@
 // @name         Font Prepender - 自訂網頁與程式碼首選字型
 // @name:zh-TW   Font Prepender - 自訂網頁與程式碼首選字型
 // @namespace    https://greasyfork.org/zh-TW/users/1237813-abc0922001
-// @version      1.0.6
+// @version      1.0.7
 // @description  將 Google Sans、Noto Sans CJK TC 與 Intel One Mono、Noto Sans Mono CJK TC 前置於網頁字型清單最前方，不破壞原始排版與圖示字型
 // @description:zh-TW 將 Google Sans、Noto Sans CJK TC 與 Intel One Mono、Noto Sans Mono CJK TC 前置於網頁字型清單最前方，不破壞原始排版與圖示字型
 // @author       abc0922001
@@ -1472,16 +1472,12 @@
   }
 
   /**
-   * 監聽樣式表動態插入與載入事件、行內樣式屬性變更（整合單次遍歷、祖先去重與屬性變更合併）
-   * @param {Document|ShadowRoot} targetDoc 目標文件或根節點
+   * 建立並啟動第二階段（互動與 SPA 執行期）全域增量監聽器
+   * 支援單趟原地走訪、容器感知祖先去重、O(1) 標籤剪枝與重複 style 屬性變更合併
+   * @param {Document|ShadowRoot} targetDoc 目標文件或 ShadowRoot
+   * @param {Node} targetNode 監聽掛載根節點
    */
-  function observeStyleSheets(targetDoc = document) {
-    if (observedRoots.has(targetDoc)) {
-      return;
-    }
-    observedRoots.add(targetDoc);
-
-    const targetNode = targetDoc.documentElement || targetDoc;
+  function startPhase2Observer(targetDoc, targetNode) {
     if (!targetNode || typeof MutationObserver === 'undefined') {
       return;
     }
@@ -1492,7 +1488,6 @@
       let modifiedStyleTargets = null;
       let containerSet = null;
 
-      const isDocLoading = (targetDoc.ownerDocument || targetDoc).readyState === 'loading';
       const prevInternal = isInternalStyleWrite;
       isInternalStyleWrite = true;
 
@@ -1599,8 +1594,8 @@
                   patchElementInlineStyle(node);
                 }
 
-                // 互動期（SPA 動態渲染）：以單次 querySelectorAll 取代原先 3 次獨立子樹遍歷
-                if (!isDocLoading && node.firstElementChild && typeof node.querySelectorAll === 'function') {
+                // 互動期（SPA 動態渲染）與 ShadowRoot：以單次 querySelectorAll 同時掃描子樹行內樣式與樣式表
+                if (node.firstElementChild && typeof node.querySelectorAll === 'function') {
                   try {
                     const subItems = node.querySelectorAll('[style*="font-family" i], style, link[rel="stylesheet"]');
                     const subLen = subItems.length;
@@ -1633,6 +1628,10 @@
             }
           }
         }
+        // 同步清空本輪內部寫回行內樣式所衍生的屬性 MutationRecord 回音，避免觸發第二次多餘微任務喚醒
+        if ((modifiedStyleTargets || hasAddedElements) && typeof observer.takeRecords === 'function') {
+          observer.takeRecords();
+        }
       } finally {
         isInternalStyleWrite = prevInternal;
       }
@@ -1651,6 +1650,119 @@
       attributes: true,
       attributeFilter: ['style']
     });
+  }
+
+  /**
+   * 兩階段監聽樣式表動態插入、載入事件與行內樣式變更（Issue #5）
+   * - 第一階段（HTML Streaming 解析期，readyState === 'loading'）：僅輕量監聽 <html> 直接子節點與 <head> 內樣式表，
+   *   完全隔離 <body> 串流解析數千節點時產生的 MutationRecord 風暴；待 DOMContentLoaded 完成全頁批次補齊後無縫升級。
+   * - 第二階段（互動與 SPA 執行期，及所有 ShadowRoot）：掛載完整 childList + subtree + attributes(style) 增量監聽。
+   * @param {Document|ShadowRoot} targetDoc 目標文件或根節點
+   */
+  function observeStyleSheets(targetDoc = document) {
+    if (observedRoots.has(targetDoc)) {
+      return;
+    }
+    observedRoots.add(targetDoc);
+
+    const targetNode = targetDoc.documentElement || targetDoc;
+    if (!targetNode || typeof MutationObserver === 'undefined') {
+      return;
+    }
+
+    // 若目標為已完成解析之 Document 或為 ShadowRoot，直接進入第二階段全域監聽
+    if (targetDoc.readyState !== 'loading' || typeof targetDoc.addEventListener !== 'function') {
+      startPhase2Observer(targetDoc, targetNode);
+      return;
+    }
+
+    // 第一階段（Phase 1）：HTML 串流解析期輕量 <head> 專用監聽器（零 <body> 子樹與屬性監聽開銷）
+    let observedHead = null;
+    const handlePhase1StyleNode = (node) => {
+      const tagName = node.tagName;
+      if (tagName === 'STYLE' || tagName === 'style') {
+        if (node.sheet) {
+          processStyleSheet(node.sheet);
+          return false;
+        }
+        return true;
+      }
+      if ((tagName === 'LINK' || tagName === 'link') && node.rel === 'stylesheet') {
+        if (node.sheet) {
+          processStyleSheet(node.sheet);
+        } else if (typeof node.addEventListener === 'function') {
+          node.addEventListener('load', () => {
+            if (node.sheet) processStyleSheet(node.sheet);
+          }, { once: true });
+        }
+      }
+      return false;
+    };
+
+    const phase1Observer = new MutationObserver((mutations) => {
+      let shouldScanStylesheets = false;
+      const mutLen = mutations.length;
+
+      for (let i = 0; i < mutLen; i++) {
+        const added = mutations[i].addedNodes;
+        const addedLen = added.length;
+        for (let j = 0; j < addedLen; j++) {
+          const node = added[j];
+          if (!node || node.nodeType !== 1) continue;
+          const tagName = node.tagName;
+
+          if (tagName === 'HEAD' || tagName === 'head') {
+            if (node !== observedHead) {
+              observedHead = node;
+              phase1Observer.observe(node, { childList: true, subtree: true });
+            }
+            if (node.firstElementChild && typeof node.querySelectorAll === 'function') {
+              try {
+                const headItems = node.querySelectorAll('style, link[rel="stylesheet"]');
+                for (let k = 0; k < headItems.length; k++) {
+                  if (handlePhase1StyleNode(headItems[k])) {
+                    shouldScanStylesheets = true;
+                  }
+                }
+              } catch {
+                // 容錯防禦
+              }
+            }
+          } else if (handlePhase1StyleNode(node)) {
+            shouldScanStylesheets = true;
+          }
+        }
+      }
+
+      if (shouldScanStylesheets) {
+        scanAndPatchStyleSheets(targetDoc);
+      }
+    });
+
+    // 非遞迴監聽 <html> 直接子節點（捕捉極早期 <head> 建立與直接附加至 documentElement 之樣式，不觸及 <body> 內部）
+    phase1Observer.observe(targetNode, { childList: true, subtree: false });
+
+    // 若 <head> 已存在，立即監聽 <head> 內部樣式表串流插入
+    if (targetDoc.head) {
+      observedHead = targetDoc.head;
+      phase1Observer.observe(observedHead, { childList: true, subtree: true });
+    }
+
+    // DOMContentLoaded 階段切換：先卸載 Phase 1、完成一次性 C++ 全頁補齊掃描，再掛載 Phase 2（避免補齊寫入觸發冗餘 MutationRecord）
+    targetDoc.addEventListener('DOMContentLoaded', () => {
+      phase1Observer.disconnect();
+      injectBaseStyles(targetDoc);
+      scanAndPatchStyleSheets(targetDoc);
+      scanAndPatchInlineStyles(targetDoc);
+      scanAndPatchShadowRoots(targetDoc);
+      if (hasCorsSheets) {
+        scheduleIdleComputedStylePatch();
+      }
+      const currentRoot = targetDoc.documentElement || targetDoc;
+      if (currentRoot) {
+        startPhase2Observer(targetDoc, currentRoot);
+      }
+    }, { once: true });
   }
 
   // --- 初始化流程 ---
@@ -1673,29 +1785,16 @@
     // 4. 靜態同源 CSSOM 掃描
     scanAndPatchStyleSheets(document);
 
-    // 5. 掃描行內樣式與 Declarative Shadow DOM (若已進入 DOMContentLoaded 之後則立即執行，loading 期間留待 DOMContentLoaded 統一執行)
+    // 5. 若頁面已超過 loading 階段，立即掃描行內樣式與 Declarative Shadow DOM（loading 期間由 observeStyleSheets 於 DOMContentLoaded 統一補齊）
     if (document.readyState !== 'loading') {
       scanAndPatchInlineStyles(document);
       scanAndPatchShadowRoots(document);
     }
 
-    // 6. 監聽動態樣式注入與行內樣式變更
+    // 6. 啟動兩階段動態樣式與行內樣式監聽
     observeStyleSheets(document);
 
-    // 7. 若在 DOMContentLoaded 或 load 事件發生前載入，註冊生命週期鉤子再次掃描
-    if (document.readyState === 'loading') {
-      document.addEventListener('DOMContentLoaded', () => {
-        injectBaseStyles(document);
-        scanAndPatchStyleSheets(document);
-        scanAndPatchInlineStyles(document);
-        scanAndPatchShadowRoots(document);
-        if (hasCorsSheets) {
-          scheduleIdleComputedStylePatch();
-        }
-      }, { once: true });
-    }
-
-    // 8. window load 完成後若存在跨域樣式表，執行一次 computed style patch
+    // 7. window load 完成後若存在跨域樣式表，執行一次 computed style patch
     if (typeof window !== 'undefined') {
       window.addEventListener('load', () => {
         if (hasCorsSheets) {
