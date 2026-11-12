@@ -71,11 +71,12 @@
 * **CSSOM 掃描 (`processRules`)**：遞迴走訪 `CSSStyleRule` 與巢狀分組規則（`@media`, `@supports`, `@container`），並支援 `:root` 等規則內之 `--font-*` CSS 自訂變數前置。
 * **內部寫入重入防護 (`isInternalStyleWrite` & `setStylePropertyInternal`)**：
   * 由於 `hookCSSPrototypes` 攔截了 `CSSStyleDeclaration.prototype.setProperty` 與 `fontFamily` setter，腳本內部（`processRules`、`patchElementInlineStyle`、`patchComputedStyles`）寫回已前置字型時，**必須統一呼叫 `setStylePropertyInternal`**，以 $\mathcal{O}(1)$ 旗標跳過攔截器二次解析與快取污染。
-* **動態 DOM 增量單次掃描、剪枝與祖先去重 (`observeStyleSheets` & `scanAndPatchInlineStyles`)**：
-  * **嚴禁在 `MutationObserver` 的 `childList` 事件中對整份 `targetDoc` 重新執行全樹 `querySelectorAll`**（否則在動態 SPA 頁面會退化為 $\mathcal{O}(N^2)$ 複雜度）。
-  * 新增元素節點透過 `batchSet` 進行祖先去重（若其祖先已在同一批次則忽略子節點），並以 `PRUNE_TAG_REGEX` 剪枝非文本節點（`SCRIPT`, `SVG` 等）。
+* **兩階段動態 DOM 監聽、剪枝與祖先去重 (`observeStyleSheets` & `scanAndPatchInlineStyles`)**：
+  * **第一階段（Phase 1：HTML Streaming 解析期，`targetDoc.readyState === 'loading'`）**：為消除頁面串流解析數千個 `<body>` 節點時的 `MutationRecord` 主執行緒事件風暴，載入初期關閉 `attributes` 監聽與 `documentElement` 的 `subtree`，僅以 `{ childList: true, subtree: false }` 監聽 `documentElement`（支援極早期 `document.head === null` 時捕捉 `<head>` 建立）並對 `<head>` 監聽 `<style>` 與 `<link rel="stylesheet">`，對 `<body>` 子樹維持零監聽開銷；待 `DOMContentLoaded` 觸發時先 `disconnect()` 卸載第一階段、完成單次 C++ 全頁批次補齊掃描，再無縫掛載第二階段全域監聽。
+  * **第二階段（Phase 2：互動與 SPA 執行期，及所有 `ShadowRoot`）**：**嚴禁在 `MutationObserver` 的 `childList` 事件中對整份 `targetDoc` 重新執行全樹 `querySelectorAll`**（否則在動態 SPA 頁面會退化為 $\mathcal{O}(N^2)$ 複雜度）。
+  * 新增元素節點原地走訪並僅針對具子元素之容器節點建立 `containerSet` 執行祖先去重（純葉節點突發批次維持零 `Set` 配置），搭配 `OB_PRUNE_TAGS_SET` 以 $\mathcal{O}(1)$ 剪枝非文本節點（`SCRIPT`, `SVG` 等）。
   * 新增容器子樹以單次 `node.querySelectorAll('[style*="font-family" i], style, link[rel="stylesheet"]')` 同時處理行內樣式與巢狀樣式表，徹底消除原先 3 次獨立子樹遍歷開銷。
-  * 同一批次內多筆相同的 `attributes: style` 變更以 `modifiedStyleTargets = new Set()` 合併，保證單一元素單批次僅執行一次樣式檢查。
+  * 同一批次內多筆相同的 `attributes: style` 變更以惰性 `modifiedStyleTargets = new Set()` 合併，保證單一元素單批次僅執行一次樣式檢查；並於批次寫回結束前呼叫 `observer.takeRecords()` 同步排空自身寫入衍生之回音紀錄，杜絕二次微任務喚醒。
 * **計算樣式修補時間切片與兩階段讀寫分離 (`patchComputedStyles`)**：
   * 針對含有跨域（CORS）樣式表的頁面，於空閒期抽樣修補時，結合 `IdleDeadline.timeRemaining()` 與 **4ms 時間切片預算**（`SLICE_BUDGET_MS = 4`），嚴格區分為 **第一階段（Batch Read）** 與 **第二階段（Batch Write）**，徹底消除強制同步重排（Style Thrashing）；若元素超過單切片處理上限則自動續排下一批，打破 500 筆上限限制。
 * **跨域樣式表 Fetch 防護**：
@@ -117,7 +118,7 @@ npm run check
 ```bash
 npm run test
 ```
-* **驗收標準**：`tests/parser.test.js`、`tests/dom.test.js` 與 `tests/sites.test.js` 全部 66 項測試綠燈通過。
+* **驗收標準**：`tests/parser.test.js`、`tests/dom.test.js` 與 `tests/sites.test.js` 全部 68 項測試綠燈通過。
 
 ### 5.3 量化效能評估 (Performance Benchmark)
 ```bash

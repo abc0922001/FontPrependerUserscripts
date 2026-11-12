@@ -10,11 +10,12 @@ function createEnvironment(html = '<!DOCTYPE html><html><head></head><body></bod
   });
 
   const { window } = dom;
-  const { document, Element, HTMLElement, MutationObserver, CSSStyleSheet, CSSStyleDeclaration } = window;
 
   if (typeof beforeInit === 'function') {
-    beforeInit(window, document);
+    beforeInit(window, window.document);
   }
+
+  const { document, Element, HTMLElement, MutationObserver, CSSStyleSheet, CSSStyleDeclaration } = window;
 
   const code = fs.readFileSync(new URL('../src/FontPrepender.user.js', import.meta.url), 'utf8');
   const module = { exports: {} };
@@ -452,7 +453,137 @@ describe('DOM / CSSOM 與特例整合測試', () => {
     }).not.toThrow();
   });
 
-  it('16. 應於 <head> 注入 Google Fonts 線上樣式表並維持冪等性與略過保護', () => {
+  // Issue #5: 兩階段 MutationObserver 消除 HTML Streaming 解析期 CPU 負載風暴
+  it('16. 載入期 (loading) 應僅監聽 <head> 樣式表而隔離 <body> 節點風暴，並於 DOMContentLoaded 後無縫升級為全域監聽 (Issue #5)', async () => {
+    let observerCallbackCount = 0;
+    let disconnectCount = 0;
+    let controlledState = 'loading';
+    let triggerDCL = null;
+
+    const { document } = createEnvironment('<!DOCTYPE html><html><head></head><body></body></html>', (win, doc) => {
+      // 鎖定可控的串流解析階段，攔截 JSDOM 預設於 nextTick 自動觸發之 DOMContentLoaded
+      Object.defineProperty(doc, 'readyState', {
+        configurable: true,
+        get: () => controlledState
+      });
+      const origAddEventListener = doc.addEventListener.bind(doc);
+      doc.addEventListener = (type, listener, options) => {
+        if (type === 'DOMContentLoaded') {
+          triggerDCL = listener;
+          return;
+        }
+        return origAddEventListener(type, listener, options);
+      };
+
+      const OrigMO = win.MutationObserver;
+      win.MutationObserver = class SpyMutationObserver extends OrigMO {
+        constructor(cb) {
+          super((mutations, obs) => {
+            observerCallbackCount++;
+            return cb(mutations, obs);
+          });
+        }
+        disconnect() {
+          disconnectCount++;
+          return super.disconnect();
+        }
+      };
+    });
+
+    // 確認目前處於受控 HTML 串流解析階段 (readyState === 'loading')
+    expect(document.readyState).toBe('loading');
+    expect(typeof triggerDCL).toBe('function');
+    observerCallbackCount = 0;
+
+    // 1. 於 <head> 動態插入 <style>，Phase 1 應在微任務內即時攔截並改寫
+    const headStyle = document.createElement('style');
+    headStyle.textContent = '.streaming-hero { font-family: Arial, sans-serif; }';
+    document.head.appendChild(headStyle);
+
+    await new Promise((resolve) => setTimeout(resolve, 15));
+    expect(headStyle.sheet.cssRules[0].style.getPropertyValue('font-family')).toContain('Google Sans');
+    expect(observerCallbackCount).toBe(1);
+
+    // 2. 模擬瀏覽器串流解析大量 <body> 節點與屬性變更：Phase 1 完全不應觸發任何 MutationObserver 回呼
+    observerCallbackCount = 0;
+    const bodyFragment = document.createDocumentFragment();
+    let streamingInlineSpan = null;
+    for (let i = 0; i < 200; i++) {
+      const div = document.createElement('div');
+      if (i === 100) {
+        streamingInlineSpan = document.createElement('span');
+        streamingInlineSpan.setAttribute('style', 'font-family: Arial, sans-serif;');
+        div.appendChild(streamingInlineSpan);
+      }
+      bodyFragment.appendChild(div);
+    }
+    document.body.appendChild(bodyFragment);
+    streamingInlineSpan.setAttribute('style', 'color: #333; font-family: Georgia, serif;');
+
+    await new Promise((resolve) => setTimeout(resolve, 15));
+    // 驗證 <body> 串流期間零 MutationObserver 微任務喚醒，且靜態行內樣式留待 DOMContentLoaded 批次處理
+    expect(observerCallbackCount).toBe(0);
+    expect(streamingInlineSpan.style.getPropertyValue('font-family')).toBe('Georgia, serif');
+
+    // 3. 觸發 DOMContentLoaded：應先 disconnect Phase 1、一次性補齊 <body> 行內樣式，再掛載 Phase 2
+    observerCallbackCount = 0;
+    controlledState = 'interactive';
+    triggerDCL();
+
+    expect(disconnectCount).toBe(1);
+    expect(streamingInlineSpan.style.getPropertyValue('font-family')).toContain('Google Sans');
+
+    // 驗證補齊掃描期間的內部寫入未觸發多餘的 Phase 2 MutationRecord（因為先完成掃描才 observe Phase 2）
+    await new Promise((resolve) => setTimeout(resolve, 15));
+    expect(observerCallbackCount).toBe(0);
+
+    // 4. 進入互動期 (Phase 2) 後，動態插入 <body> 的節點與 style 屬性變動應即時被攔截改寫
+    const spaNode = document.createElement('div');
+    spaNode.setAttribute('style', 'font-family: Verdana, sans-serif;');
+    document.body.appendChild(spaNode);
+
+    await new Promise((resolve) => setTimeout(resolve, 15));
+    expect(observerCallbackCount).toBe(1);
+    expect(spaNode.style.getPropertyValue('font-family')).toContain('Google Sans');
+  });
+
+  it('17. 極早期 document-start 尚無 <head> 節點時，Phase 1 應在 <head> 掛載瞬間自動銜接樣式表監聽 (Issue #5)', async () => {
+    const { document } = createEnvironment('<!DOCTYPE html><html><head></head><body></body></html>', (win, doc) => {
+      Object.defineProperty(doc, 'readyState', {
+        configurable: true,
+        get: () => 'loading'
+      });
+      doc.addEventListener = (type) => {
+        if (type === 'DOMContentLoaded') return;
+      };
+      // 模擬極早期 document-start：僅有 <html> 而 <head> 與 <body> 尚未被解析器建立
+      if (doc.head) doc.head.remove();
+      if (doc.body) doc.body.remove();
+    });
+
+    expect(document.readyState).toBe('loading');
+    expect(document.head).toBeNull();
+
+    // 1. 模擬 HTML 解析器建立 <head> 並同時帶有首個內嵌 <style>
+    const newHead = document.createElement('head');
+    const firstStyle = document.createElement('style');
+    firstStyle.textContent = '.early-first { font-family: Helvetica, sans-serif; }';
+    newHead.appendChild(firstStyle);
+    document.documentElement.appendChild(newHead);
+
+    await new Promise((resolve) => setTimeout(resolve, 15));
+    expect(firstStyle.sheet.cssRules[0].style.getPropertyValue('font-family')).toContain('Google Sans');
+
+    // 2. 後續繼續串流插入 <head> 的第二個 <style> 也應被自動銜接的 <head> 監聽器即時改寫
+    const secondStyle = document.createElement('style');
+    secondStyle.textContent = '.early-second { font-family: Tahoma, sans-serif; }';
+    newHead.appendChild(secondStyle);
+
+    await new Promise((resolve) => setTimeout(resolve, 15));
+    expect(secondStyle.sheet.cssRules[0].style.getPropertyValue('font-family')).toContain('Google Sans');
+  });
+
+  it('18. 應於 <head> 注入 Google Fonts 線上樣式表並維持冪等性與略過保護', () => {
     const { document, exports } = createEnvironment();
     exports.injectBaseStyles(document);
 
