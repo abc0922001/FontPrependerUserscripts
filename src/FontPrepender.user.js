@@ -693,7 +693,7 @@
       if (typeof CSSStyleSheet === 'function' && 'replaceSync' in CSSStyleSheet.prototype) {
         sharedBaseSheet = new CSSStyleSheet();
         sharedBaseSheet.replaceSync(`
-:where(html, body) { font-family: ${BASE_SANS_STACK}; }
+:where(html, body, :host) { font-family: ${BASE_SANS_STACK}; }
 :where(code, pre, kbd, samp, tt, var) { font-family: ${BASE_MONO_STACK}; }
 :where(h1, h2, h3, h4, h5, h6, p, blockquote, q, li, dt, dd, td, th, label, summary, details) { font-family: ${BASE_SANS_STACK}; }
 :where(input, textarea, select, button, [contenteditable="true"]) { font-family: ${BASE_SANS_STACK}; }
@@ -740,7 +740,7 @@
       const baseStyle = document.createElement('style');
       baseStyle.id = BASE_STYLE_ID;
       baseStyle.textContent = `
-:where(html, body) {
+:where(html, body, :host) {
   font-family: ${BASE_SANS_STACK};
 }
 :where(code, pre, kbd, samp, tt, var) {

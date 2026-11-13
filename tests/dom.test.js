@@ -52,6 +52,7 @@ describe('DOM / CSSOM 與特例整合測試', () => {
 
     const baseStyle = document.querySelector('#font-prepender-base-style');
     expect(baseStyle).not.toBeNull();
+    expect(baseStyle.textContent).toContain(':where(html, body, :host)');
     expect(baseStyle.textContent).toContain(exports.BASE_SANS_STACK);
     expect(baseStyle.textContent).toContain(exports.BASE_MONO_STACK);
 
@@ -177,7 +178,36 @@ describe('DOM / CSSOM 與特例整合測試', () => {
 
     const shadowBaseStyle = shadowRoot.querySelector('#font-prepender-base-style');
     expect(shadowBaseStyle).not.toBeNull();
+    expect(shadowBaseStyle.textContent).toContain(':where(html, body, :host)');
     expect(shadowBaseStyle.textContent).toContain('Google Sans');
+  });
+
+  it('5.0 支援 adoptedStyleSheets 時，sharedBaseSheet 應包含 :host 選擇器並共用掛載至 ShadowRoot', () => {
+    let capturedSheetText = '';
+    const { document, exports } = createEnvironment('<!DOCTYPE html><html><head></head><body></body></html>', (win) => {
+      win.CSSStyleSheet.prototype.replaceSync = function(text) {
+        this._text = text;
+        if (text.includes(':host')) {
+          capturedSheetText = text;
+        }
+      };
+    });
+
+    exports.initSharedConstructableStyles();
+    const sharedBase = exports.getSharedBaseSheet();
+    const sharedEditor = exports.getSharedEditorSheet();
+    expect(sharedBase).not.toBeNull();
+    expect(sharedEditor).not.toBeNull();
+    expect(capturedSheetText).toContain(':where(html, body, :host)');
+
+    const host = document.createElement('div');
+    document.body.appendChild(host);
+    const shadowRoot = host.attachShadow({ mode: 'open' });
+    shadowRoot.adoptedStyleSheets = [];
+
+    exports.injectBaseStyles(shadowRoot);
+    expect(shadowRoot.adoptedStyleSheets).toContain(sharedBase);
+    expect(shadowRoot.adoptedStyleSheets).toContain(sharedEditor);
   });
 
   it('5.1 應穿透掃描既有與 Declarative Shadow DOM (scanAndPatchShadowRoots)', () => {
