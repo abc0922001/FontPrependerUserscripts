@@ -2,7 +2,7 @@
 // @name         Font Prepender - 自訂網頁與程式碼首選字型
 // @name:zh-TW   Font Prepender - 自訂網頁與程式碼首選字型
 // @namespace    https://greasyfork.org/zh-TW/users/1237813-abc0922001
-// @version      1.0.7
+// @version      1.0.8
 // @description  將 Google Sans、Noto Sans CJK TC 與 Intel One Mono、Noto Sans Mono CJK TC 前置於網頁字型清單最前方，不破壞原始排版與圖示字型
 // @description:zh-TW 將 Google Sans、Noto Sans CJK TC 與 Intel One Mono、Noto Sans Mono CJK TC 前置於網頁字型清單最前方，不破壞原始排版與圖示字型
 // @author       abc0922001
@@ -697,7 +697,7 @@
       if (typeof CSSStyleSheet === 'function' && 'replaceSync' in CSSStyleSheet.prototype) {
         sharedBaseSheet = new CSSStyleSheet();
         sharedBaseSheet.replaceSync(`
-:where(html, body) { font-family: ${BASE_SANS_STACK}; }
+:where(html, body, :host) { font-family: ${BASE_SANS_STACK}; }
 :where(code, pre, kbd, samp, tt, var) { font-family: ${BASE_MONO_STACK}; }
 :where(h1, h2, h3, h4, h5, h6, p, blockquote, q, li, dt, dd, td, th, label, summary, details) { font-family: ${BASE_SANS_STACK}; }
 :where(input, textarea, select, button, [contenteditable="true"]) { font-family: ${BASE_SANS_STACK}; }
@@ -760,7 +760,7 @@
       const baseStyle = document.createElement('style');
       baseStyle.id = BASE_STYLE_ID;
       baseStyle.textContent = `
-:where(html, body) {
+:where(html, body, :host) {
   font-family: ${BASE_SANS_STACK};
 }
 :where(code, pre, kbd, samp, tt, var) {
