@@ -167,6 +167,65 @@ describe('真實網站排版與邊界條件覆蓋測試 (Real-World Sites Covera
       expect(link.style.getPropertyValue('font-family')).toContain('Google Sans');
       expect(iconSpan.style.getPropertyValue('font-family')).toBe('');
     });
+
+    it('面對 XDA 主站 CDN 樣式表與動態 Google Sign-In 樣式表應分別完成改寫與零 CORS 請求跳過 (Issue #6)', async () => {
+      const dom = new JSDOM('<!DOCTYPE html><html><head></head><body><h5 class="display-card-title">XDA News</h5></body></html>', {
+        url: 'https://www.xda-developers.com/i-asked-lovable-bolt-and-google-ai-studio-to-build-the-same-web-app-and-one-is-in-a-different-league/',
+        runScripts: 'dangerously'
+      });
+      const { window } = dom;
+      const { document } = window;
+
+      const cdnCssUrl = 'https://static0.xdaimages.com/assets/xda.css';
+      const cdnLink = document.createElement('link');
+      cdnLink.rel = 'stylesheet';
+      cdnLink.href = cdnCssUrl;
+      document.head.appendChild(cdnLink);
+
+      const gsiLink = document.createElement('link');
+      gsiLink.rel = 'stylesheet';
+      gsiLink.href = 'https://accounts.google.com/gsi/style';
+      document.head.appendChild(gsiLink);
+
+      const fetchSpy = vi.fn().mockResolvedValue({
+        ok: true,
+        headers: { get: () => '96' },
+        text: async () => '.display-card-title { font-family: "Titillium Web", sans-serif; }'
+      });
+      window.fetch = fetchSpy;
+
+      const scoped = loadUserscript({ window, document, URL: window.URL, fetch: fetchSpy });
+
+      // 1. 處理 XDA 主站 CDN 跨網域表：應走 fetch 改寫注入
+      scoped.processStyleSheet({
+        href: cdnCssUrl,
+        ownerNode: cdnLink,
+        get cssRules() {
+          throw new Error('SecurityError');
+        }
+      });
+
+      // 2. 處理頁面插入的 Google Sign-In 樣式表：應直接跳過，零 fetch、零誤設 hasCorsSheets
+      scoped.processStyleSheet({
+        href: 'https://accounts.google.com/gsi/style',
+        ownerNode: gsiLink,
+        get cssRules() {
+          throw new Error('SecurityError');
+        }
+      });
+
+      await new Promise((resolve) => setTimeout(resolve, 0));
+
+      expect(fetchSpy).toHaveBeenCalledTimes(1);
+      expect(fetchSpy).toHaveBeenCalledWith(cdnCssUrl, { cache: 'force-cache' });
+
+      const rewrittenStyle = cdnLink.nextSibling;
+      expect(rewrittenStyle).not.toBeNull();
+      expect(rewrittenStyle.getAttribute('data-prepended-source')).toBe(cdnCssUrl);
+      expect(rewrittenStyle.textContent).toContain('Google Sans');
+      expect(rewrittenStyle.textContent).toContain('Titillium Web');
+      expect(scoped.getHasCorsSheets()).toBe(false);
+    });
   });
 
   // ---------------------------------------------------------------------------

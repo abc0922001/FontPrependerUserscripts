@@ -3,9 +3,9 @@ import { JSDOM } from 'jsdom';
 import fs from 'node:fs';
 import vm from 'node:vm';
 
-function createEnvironment(html = '<!DOCTYPE html><html><head></head><body></body></html>', beforeInit) {
+function createEnvironment(html = '<!DOCTYPE html><html><head></head><body></body></html>', beforeInit, options = {}) {
   const dom = new JSDOM(html, {
-    url: 'https://example.com/',
+    url: options.url || 'https://example.com/',
     runScripts: 'dangerously'
   });
 
@@ -28,11 +28,13 @@ function createEnvironment(html = '<!DOCTYPE html><html><head></head><body></bod
     MutationObserver,
     CSSStyleSheet,
     CSSStyleDeclaration,
+    URL: window.URL,
     setTimeout,
     clearTimeout,
     console,
     module,
-    exports: module.exports
+    exports: module.exports,
+    ...(options.sandbox || {})
   });
 
   vm.runInContext(code, context);
@@ -446,27 +448,59 @@ describe('DOM / CSSOM 與特例整合測試', () => {
     expect(window.requestIdleCallback).toHaveBeenCalled();
   });
 
-  // Issue #2 Task 4: 跨域 CSS fetch 防護
-  it('14. 跨域樣式表為 Google Fonts 或檔案超過 1MB 時應跳過 fetch 改寫 (Issue #2)', () => {
+  // Issue #2 Task 4 & Issue #6: 跨域 CSS fetch 防護（字型 CDN / gstatic 跳過與 1MB 限制）
+  it('14. 跨域樣式表為 Google Fonts、gstatic 或檔案超過 1MB 時應跳過改寫並保留計算樣式修補備援 (Issue #2, #6)', async () => {
     const { exports, window } = createEnvironment();
     window.requestIdleCallback = vi.fn();
 
     const fetchSpy = vi.fn();
     window.fetch = fetchSpy;
 
-    // 模擬 Google Fonts 跨域樣式表
+    // 模擬 Google Fonts 與 gstatic 跨域樣式表
     const googleFontSheet = {
       href: 'https://fonts.googleapis.com/css2?family=Roboto&display=swap',
       get cssRules() {
         throw new Error('SecurityError');
       }
     };
+    const gstaticSheet = {
+      href: 'https://www.gstatic.com/recaptcha/releases/4i3aN5wAweL7i3ADI7BSX4B-/styles__ltr.css',
+      get cssRules() {
+        throw new Error('SecurityError');
+      }
+    };
 
     exports.processStyleSheet(googleFontSheet);
+    exports.processStyleSheet(gstaticSheet);
 
-    // 應命中 SKIP_FETCH_HOST_REGEX 直接跳過 fetch
+    // 應命中 SKIP_FETCH_HOST_REGEX 直接跳過 fetch，但保留 hasCorsSheets 降級備援
     expect(fetchSpy).not.toHaveBeenCalled();
     expect(exports.getHasCorsSheets()).toBe(true);
+    expect(window.requestIdleCallback).toHaveBeenCalledTimes(1);
+
+    // 獨立環境驗證 Content-Length > 1MB 檔案大小防護
+    const largeEnv = createEnvironment();
+    largeEnv.window.requestIdleCallback = vi.fn();
+    const largeFetchSpy = vi.fn().mockResolvedValue({
+      ok: true,
+      headers: { get: (h) => (h.toLowerCase() === 'content-length' ? '2000000' : null) },
+      text: async () => '.huge { font-family: Arial, sans-serif; }'
+    });
+    largeEnv.window.fetch = largeFetchSpy;
+
+    largeEnv.exports.processStyleSheet({
+      href: 'https://cdn.example.com/huge.css',
+      get cssRules() {
+        throw new Error('SecurityError');
+      }
+    });
+
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    expect(largeFetchSpy).toHaveBeenCalledTimes(1);
+    expect(largeEnv.document.querySelector('style[data-prepended-source]')).toBeNull();
+    expect(largeEnv.exports.getHasCorsSheets()).toBe(true);
+    expect(largeEnv.window.requestIdleCallback).toHaveBeenCalledTimes(1);
   });
 
   // Issue #3 目標七: 初始化與 Hook 冪等性
@@ -611,5 +645,221 @@ describe('DOM / CSSOM 與特例整合測試', () => {
 
     await new Promise((resolve) => setTimeout(resolve, 15));
     expect(secondStyle.sheet.cssRules[0].style.getPropertyValue('font-family')).toContain('Google Sans');
+  });
+
+  // Issue #6: 跨網域外部樣式表 fetch 防護與第三方功能型 iframe 隔離
+  it('18. 純第三方功能元件 CSS、非 HTTP(S) 與列印樣式表應直接短路返回且不誤觸發全頁計算樣式掃描 (Issue #6)', () => {
+    const { exports, window } = createEnvironment();
+    window.requestIdleCallback = vi.fn();
+
+    const fetchSpy = vi.fn();
+    window.fetch = fetchSpy;
+
+    const skipCases = [
+      { href: 'https://accounts.google.com/gsi/style' },
+      { href: 'https://www.google.com/recaptcha/api2/styles.css' },
+      { href: 'https://challenges.cloudflare.com/turnstile/v0/style.css' },
+      { href: 'https://pagead2.googlesyndication.com/pagead/style.css' },
+      { href: 'chrome-extension://abcdef123456/inject.css' },
+      { href: 'https://cdn.example.com/print.css', media: { mediaText: 'print' } }
+    ];
+
+    for (const item of skipCases) {
+      exports.processStyleSheet({
+        ...item,
+        get cssRules() {
+          throw new Error('SecurityError');
+        }
+      });
+    }
+
+    expect(fetchSpy).not.toHaveBeenCalled();
+    expect(exports.getHasCorsSheets()).toBe(false);
+    expect(window.requestIdleCallback).not.toHaveBeenCalled();
+  });
+
+  it('19. 主站獨立 CDN 跨網域樣式表應正常 fetch 改寫並於原 <link> 後方注入 <style> (Issue #6)', async () => {
+    const { document, exports, window } = createEnvironment();
+    window.requestIdleCallback = vi.fn();
+
+    const cdnUrl = 'https://static0.xdaimages.com/assets/main.css';
+    const linkEl = document.createElement('link');
+    linkEl.rel = 'stylesheet';
+    linkEl.href = cdnUrl;
+    document.head.appendChild(linkEl);
+
+    const fetchSpy = vi.fn().mockResolvedValue({
+      ok: true,
+      headers: { get: () => '128' },
+      text: async () => '.article-title { font-family: "Titillium Web", sans-serif; }'
+    });
+    window.fetch = fetchSpy;
+
+    exports.processStyleSheet({
+      href: cdnUrl,
+      ownerNode: linkEl,
+      get cssRules() {
+        throw new Error('SecurityError');
+      }
+    });
+
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    expect(fetchSpy).toHaveBeenCalledTimes(1);
+    expect(fetchSpy).toHaveBeenCalledWith(cdnUrl, { cache: 'force-cache' });
+
+    const injectedStyle = linkEl.nextSibling;
+    expect(injectedStyle).not.toBeNull();
+    expect(injectedStyle.tagName).toBe('STYLE');
+    expect(injectedStyle.getAttribute('data-prepended-source')).toBe(cdnUrl);
+    expect(injectedStyle.textContent).toContain('Google Sans');
+    expect(injectedStyle.textContent).toContain('Titillium Web');
+    expect(exports.getHasCorsSheets()).toBe(false);
+  });
+
+  it('20. 未知第三方 origin 初次 fetch 失敗後應記錄熔斷，避免後續同主機樣式表重複發起請求 (Issue #6)', async () => {
+    const { exports, window } = createEnvironment();
+    window.requestIdleCallback = vi.fn();
+
+    const fetchSpy = vi.fn().mockRejectedValue(new TypeError('Failed to fetch'));
+    window.fetch = fetchSpy;
+
+    exports.processStyleSheet({
+      href: 'https://widget.unknown.example/a.css',
+      get cssRules() {
+        throw new Error('SecurityError');
+      }
+    });
+
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    expect(fetchSpy).toHaveBeenCalledTimes(1);
+    expect(exports.failedFetchOrigins.has('https://widget.unknown.example')).toBe(true);
+    expect(exports.getHasCorsSheets()).toBe(true);
+    expect(window.requestIdleCallback).toHaveBeenCalledTimes(1);
+
+    // 同 origin 的第二支樣式表應立即命中熔斷，不再呼叫 fetch
+    exports.processStyleSheet({
+      href: 'https://widget.unknown.example/b.css',
+      get cssRules() {
+        throw new Error('SecurityError');
+      }
+    });
+
+    expect(fetchSpy).toHaveBeenCalledTimes(1);
+  });
+
+  it('21. shouldSkipCurrentFrame 應精準區分頂層視窗、閱讀型子框架與第三方功能型 iframe，且支援無 window 防呆 (Issue #6)', () => {
+    // 1. 無 window 環境下無參數呼叫不應拋錯
+    const code = fs.readFileSync(new URL('../src/FontPrepender.user.js', import.meta.url), 'utf8');
+    const bareModule = { exports: {} };
+    vm.runInContext(code, vm.createContext({ module: bareModule, exports: bareModule.exports, console }));
+    expect(() => bareModule.exports.shouldSkipCurrentFrame()).not.toThrow();
+    expect(bareModule.exports.shouldSkipCurrentFrame()).toBe(false);
+
+    const { exports } = createEnvironment();
+    const { shouldSkipCurrentFrame } = exports;
+
+    const makeWin = (hrefStr, isSubFrame) => {
+      const u = new URL(hrefStr);
+      const topObj = {};
+      const winObj = {
+        top: isSubFrame ? topObj : null,
+        location: { hostname: u.hostname, href: u.href }
+      };
+      winObj.self = winObj;
+      if (!isSubFrame) winObj.top = winObj;
+      return winObj;
+    };
+
+    // 2. 頂層視窗 (self === top)：即使造訪 Google 登入或 reCAPTCHA 頁亦不應跳過
+    expect(shouldSkipCurrentFrame(makeWin('https://www.google.com/recaptcha/api2/anchor', false))).toBe(false);
+    expect(shouldSkipCurrentFrame(makeWin('https://accounts.google.com/signin', false))).toBe(false);
+
+    // 3. 第三方功能型子框架 (self !== top)：應提早返回
+    const skippedFrames = [
+      'https://www.google.com/recaptcha/api2/anchor?k=1',
+      'https://accounts.google.com/gsi/iframe',
+      'https://newassets.hcaptcha.com/captcha/v1/frame.html',
+      'https://challenges.cloudflare.com/cdn-cgi/challenge-platform/h/g',
+      'https://googleads.g.doubleclick.net/pagead/ads',
+      'https://js.stripe.com/v3/elements-inner-card',
+      'https://platform.twitter.com/widgets/follow_button.html',
+      'https://www.facebook.com/plugins/like.php'
+    ];
+    for (const url of skippedFrames) {
+      expect(shouldSkipCurrentFrame(makeWin(url, true))).toBe(true);
+    }
+
+    // 4. 閱讀型子框架與空白框架 (self !== top)：應保留字型覆寫
+    const preservedFrames = [
+      'https://example.com/embedded-article',
+      'https://disqus.com/embed/comments/',
+      'https://platform.twitter.com/embed/Tweet.html',
+      'about:blank'
+    ];
+    for (const url of preservedFrames) {
+      expect(shouldSkipCurrentFrame(makeWin(url, true))).toBe(false);
+    }
+  });
+
+  it('22. Google reCAPTCHA iframe 載入時 init() 應提早返回且零注入與零 fetch，閱讀型 iframe 仍正常初始化 (Issue #6)', () => {
+    const runInSubFrame = (frameUrl, html) => {
+      const dom = new JSDOM(html, { url: frameUrl, runScripts: 'dangerously' });
+      const { window } = dom;
+      const { document, Element, HTMLElement, MutationObserver, CSSStyleSheet, CSSStyleDeclaration } = window;
+      const fetchSpy = vi.fn();
+      window.fetch = fetchSpy;
+
+      const parentTop = {};
+      const frameWindowProxy = new Proxy(window, {
+        get(target, prop) {
+          if (prop === 'top') return parentTop;
+          if (prop === 'self' || prop === 'window') return frameWindowProxy;
+          const val = Reflect.get(target, prop, target);
+          return typeof val === 'function' ? val.bind(target) : val;
+        },
+        set(target, prop, value) {
+          return Reflect.set(target, prop, value, target);
+        }
+      });
+
+      const code = fs.readFileSync(new URL('../src/FontPrepender.user.js', import.meta.url), 'utf8');
+      const module = { exports: {} };
+      vm.runInContext(code, vm.createContext({
+        window: frameWindowProxy,
+        document,
+        Element,
+        HTMLElement,
+        MutationObserver,
+        CSSStyleSheet,
+        CSSStyleDeclaration,
+        URL: window.URL,
+        setTimeout,
+        clearTimeout,
+        console,
+        module,
+        exports: module.exports
+      }));
+
+      return { document, exports: module.exports, fetchSpy };
+    };
+
+    // Google reCAPTCHA anchor iframe：完全跳過初始化
+    const recaptchaEnv = runInSubFrame(
+      'https://www.google.com/recaptcha/api2/anchor?k=test',
+      '<!DOCTYPE html><html><head></head><body><div class="rc-anchor">reCAPTCHA</div></body></html>'
+    );
+    expect(recaptchaEnv.exports.getIsInitialized()).toBe(false);
+    expect(recaptchaEnv.document.querySelector('#font-prepender-base-style')).toBeNull();
+    expect(recaptchaEnv.fetchSpy).not.toHaveBeenCalled();
+
+    // 跨源閱讀型子框架（Disqus）：正常初始化並注入基礎樣式
+    const disqusEnv = runInSubFrame(
+      'https://disqus.com/embed/comments/?base=default',
+      '<!DOCTYPE html><html><head></head><body><div id="layout"><p>留言內容</p></div></body></html>'
+    );
+    expect(disqusEnv.exports.getIsInitialized()).toBe(true);
+    expect(disqusEnv.document.querySelector('#font-prepender-base-style')).not.toBeNull();
   });
 });

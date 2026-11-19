@@ -80,7 +80,10 @@
 * **計算樣式修補時間切片與兩階段讀寫分離 (`patchComputedStyles`)**：
   * 針對含有跨域（CORS）樣式表的頁面，於空閒期抽樣修補時，結合 `IdleDeadline.timeRemaining()` 與 **4ms 時間切片預算**（`SLICE_BUDGET_MS = 4`），嚴格區分為 **第一階段（Batch Read）** 與 **第二階段（Batch Write）**，徹底消除強制同步重排（Style Thrashing）；若元素超過單切片處理上限則自動續排下一批，打破 500 筆上限限制。
 * **跨域樣式表 Fetch 防護**：
-  * 遇到拋出 `SecurityError` 之跨域樣式表時，以 `SKIP_FETCH_HOST_REGEX` 過濾純字型/圖示 CDN（如 `fonts.googleapis.com`、`use.fontawesome.com` 等），且在 `Content-Length > 1MB` 時放棄下載改寫，並透過 `{ cache: 'force-cache' }` 優先命中快取。
+  * 遇到拋出 `SecurityError` 之跨域樣式表時，先跳過 `media="print"` 與非 `http:`/`https:` 協議樣式表；針對登入、驗證碼、廣告、金流、CMP 等純第三方功能元件（`SKIP_THIRD_PARTY_FETCH_HOST_REGEX`、`SKIP_THIRD_PARTY_FETCH_URL_REGEX`）直接短路返回且不誤設 `hasCorsSheets`；字型/圖示 CDN 與 `gstatic.com`（`SKIP_FETCH_HOST_REGEX`）則跳過 `fetch` 並保留空閒計算樣式修補備援。
+  * 針對未知第三方主機若初次 `fetch` 發生網路或 CORS 阻斷失敗，將其 `origin` 寫入有界 `failedFetchOrigins`（上限 `MAX_FAILED_ORIGINS = 200`）執行同源熔斷；其餘主站 CDN 樣式表維持透過 `{ cache: 'force-cache' }` 下載改寫，並在 `Content-Length > 1MB` 時放棄下載改寫。
+* **第三方功能型 `iframe` 隔離護欄 (`shouldSkipCurrentFrame`)**：
+  * 維持 `@allFrames true` 以保留同源與閱讀型 `iframe` 的字型覆寫能力，並於 `init()` 最前端（`isInitialized = true` 之前）呼叫 `shouldSkipCurrentFrame()`，僅在處於子框架（`self !== top`）且命中 `SKIP_IFRAME_HOST_REGEX` 或 `SKIP_IFRAME_URL_REGEX`（驗證碼、第三方登入、廣告、金流與社群按鈕）時提早返回，達成零注入、零監聽與零 CORS 請求。
 * **WeakSet 弱引用追蹤與 Hook 冪等性**：樣式表（`processedStyleSheets`）、ShadowRoot（`processedShadowRoots`）、已監聽文件（`observedRoots`）與抽樣元素（`processedElements`）皆使用 `WeakSet`；原型鏈攔截器以 `_fpHooked` 標記防重複包裝，`init()` 具備嚴格冪等性。
 * **Shadow DOM 穿透與資源共用**：攔截 `Element.prototype.attachShadow`，並在支援環境下共用預編譯之 Constructable `CSSStyleSheet`，省去各 ShadowRoot 注入 `<style>` 元素開銷。
 * **Chrome 內建整頁翻譯隔離護欄 (`isTranslationNode`)**：
@@ -118,7 +121,7 @@ npm run check
 ```bash
 npm run test
 ```
-* **驗收標準**：`tests/parser.test.js`、`tests/dom.test.js` 與 `tests/sites.test.js` 全部 68 項測試綠燈通過。
+* **驗收標準**：`tests/parser.test.js`、`tests/dom.test.js` 與 `tests/sites.test.js` 全部 75 項測試綠燈通過。
 
 ### 5.3 量化效能評估 (Performance Benchmark)
 ```bash

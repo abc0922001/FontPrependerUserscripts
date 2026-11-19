@@ -2,7 +2,7 @@
 // @name         Font Prepender - 自訂網頁與程式碼首選字型
 // @name:zh-TW   Font Prepender - 自訂網頁與程式碼首選字型
 // @namespace    https://greasyfork.org/zh-TW/users/1237813-abc0922001
-// @version      1.0.8
+// @version      1.0.9
 // @description  將 Google Sans、Noto Sans CJK TC 與 Intel One Mono、Noto Sans Mono CJK TC 前置於網頁字型清單最前方，不破壞原始排版與圖示字型
 // @description:zh-TW 將 Google Sans、Noto Sans CJK TC 與 Intel One Mono、Noto Sans Mono CJK TC 前置於網頁字型清單最前方，不破壞原始排版與圖示字型
 // @author       abc0922001
@@ -111,9 +111,18 @@
     'HEAD', 'head', 'META', 'meta'
   ]);
 
-  // 跨域 CSS fetch 跳過主機（字型發布庫或圖示專用 CDN 無需重複下載改寫）
-  const SKIP_FETCH_HOST_REGEX = /(?:^|\.)(?:fonts\.googleapis\.com|fonts\.bunny\.net|use\.typekit\.net|(?:use|kit)\.fontawesome\.com)$/i;
+  // 跨域 CSS fetch 跳過主機（字型/圖示 CDN 與 gstatic，跳過 fetch 並保留空閒計算樣式修補備援）
+  const SKIP_FETCH_HOST_REGEX = /(?:^|\.)(?:fonts\.googleapis\.com|fonts\.bunny\.net|(?:use|p)\.typekit\.net|(?:use|kit)\.fontawesome\.com|gstatic\.com)$/i;
+  // 純第三方功能元件跨域 CSS 跳過主機（登入、驗證碼、廣告、金流、CMP，直接短路返回且不誤觸發全頁計算樣式掃描）
+  const SKIP_THIRD_PARTY_FETCH_HOST_REGEX = /(?:^|\.)(?:accounts\.google\.com|recaptcha\.net|hcaptcha\.com|challenges\.cloudflare\.com|appleid\.cdn-apple\.com|googlesyndication\.com|doubleclick\.net|googleadservices\.com|fundingchoicesmessages\.google\.com|connect\.facebook\.net|js\.stripe\.com|cdn\.cookielaw\.org|consent\.cookiebot\.com)$/i;
+  // 純第三方功能元件跨域 CSS 跳過路徑（共享主網域下之驗證碼等元件路徑）
+  const SKIP_THIRD_PARTY_FETCH_URL_REGEX = /^https?:\/\/(?:[^/]+\.)?google\.com\/recaptcha\//i;
+  // 第三方功能型 iframe 跳過主機（僅於子框架 self !== top 生效，避免干擾驗證碼、登入、廣告與金流框架）
+  const SKIP_IFRAME_HOST_REGEX = /(?:^|\.)(?:accounts\.google\.com|apis\.google\.com|fundingchoicesmessages\.google\.com|recaptcha\.net|hcaptcha\.com|challenges\.cloudflare\.com|arkoselabs\.com|funcaptcha\.com|appleid\.apple\.com|login\.microsoftonline\.com|googlesyndication\.com|doubleclick\.net|googleadservices\.com|adnxs\.com|amazon-adsystem\.com|criteo\.(?:com|net)|js\.stripe\.com|hooks\.stripe\.com)$/i;
+  // 第三方功能型 iframe 跳過路徑（保留主站與內嵌推文閱讀框，僅排除驗證碼與社群按鈕）
+  const SKIP_IFRAME_URL_REGEX = /^https?:\/\/(?:[^/]+\.)?(?:google\.com\/recaptcha\/|platform\.twitter\.com\/widgets\/|facebook\.com\/plugins\/)/i;
   const MAX_FETCH_BYTES = 1000000; // 1 MB
+  const MAX_FAILED_ORIGINS = 200;
 
   // Computed Style 時間切片預算（毫秒）
   const SLICE_BUDGET_MS = 4.0;
@@ -143,6 +152,7 @@
   const processedElements = new WeakSet();
   const styleToElementMap = new WeakMap();
   const fetchedStyleSheetUrls = new Set();
+  const failedFetchOrigins = new Set();
   const observedRoots = new WeakSet();
 
   // 共用 Constructable Stylesheets 實例（Web Components ShadowRoot 資源共用）
@@ -898,25 +908,49 @@
       // 特例二：跨域樣式表存取拋出 SecurityError
       processedStyleSheets.add(sheet);
 
+      // 列印專用樣式表不影響螢幕排版，直接短路略過
+      if (sheet.media && typeof sheet.media.mediaText === 'string' && sheet.media.mediaText.trim().toLowerCase() === 'print') {
+        return;
+      }
+
       const href = sheet.href;
-      // 跨域 CDN 過濾：若為 Google Fonts / Typekit / FontAwesome 等字型與圖示分發主機，無需重複 fetch 改寫
-      if (href) {
+      const UrlCtor = typeof URL === 'function'
+        ? URL
+        : (typeof window !== 'undefined' && typeof window.URL === 'function' ? window.URL : null);
+      let parsedUrl = null;
+
+      if (href && UrlCtor) {
         try {
-          const host = new URL(href).hostname;
-          if (SKIP_FETCH_HOST_REGEX.test(host)) {
-            hasCorsSheets = true;
-            scheduleIdleComputedStylePatch();
-            return;
-          }
+          parsedUrl = new UrlCtor(href);
         } catch {
           // 容錯防禦
         }
       }
 
+      if (parsedUrl) {
+        if (parsedUrl.protocol !== 'http:' && parsedUrl.protocol !== 'https:') {
+          return;
+        }
+        const host = parsedUrl.hostname;
+        // 純第三方功能元件 CSS（登入、驗證碼、廣告、金流、CMP）：直接短路不抓檔且不誤觸發全頁計算樣式掃描
+        if (SKIP_THIRD_PARTY_FETCH_HOST_REGEX.test(host) || SKIP_THIRD_PARTY_FETCH_URL_REGEX.test(href)) {
+          return;
+        }
+        // 字型/圖示 CDN、gstatic 與先前曾發生失敗之 origin：跳過 fetch 並保留空閒計算樣式修補備援
+        if (SKIP_FETCH_HOST_REGEX.test(host) || failedFetchOrigins.has(parsedUrl.origin)) {
+          hasCorsSheets = true;
+          scheduleIdleComputedStylePatch();
+          return;
+        }
+      }
+
       // 若為外部 link 樣式表且支援 fetch，嘗試直接下載改寫注入（解決 XDA 等 CDN 外部樣式表）
-      if (typeof fetch === 'function' && href && !fetchedStyleSheetUrls.has(href)) {
+      const fetchFn = typeof fetch === 'function'
+        ? fetch
+        : (typeof window !== 'undefined' && typeof window.fetch === 'function' ? window.fetch.bind(window) : null);
+      if (fetchFn && href && !fetchedStyleSheetUrls.has(href)) {
         fetchedStyleSheetUrls.add(href);
-        fetch(href, { cache: 'force-cache' })
+        fetchFn(href, { cache: 'force-cache' })
           .then((res) => {
             if (!res || !res.ok) {
               hasCorsSheets = true;
@@ -953,6 +987,10 @@
             }
           })
           .catch(() => {
+            // 同 origin 失敗熔斷：記錄無法通過 CORS 讀取之 origin，避免後續同主機樣式表重複觸發紅字
+            if (parsedUrl && parsedUrl.origin && failedFetchOrigins.size < MAX_FAILED_ORIGINS) {
+              failedFetchOrigins.add(parsedUrl.origin);
+            }
             // fetch 失敗時退避至空閒計算樣式修補
             hasCorsSheets = true;
             scheduleIdleComputedStylePatch();
@@ -1765,9 +1803,41 @@
     }, { once: true });
   }
 
+  /**
+   * 判斷當前執行視窗是否為應提早退出的第三方功能型 iframe（驗證碼、第三方登入、廣告、金流等）
+   * 僅於子框架（self !== top）生效，保留頂層頁面與閱讀型 iframe 之字型覆寫能力
+   * @param {Window|null} [win] 目標視窗物件
+   * @returns {boolean} 是否應跳過初始化
+   */
+  function shouldSkipCurrentFrame(win = typeof window !== 'undefined' ? window : null) {
+    if (!win) return false;
+
+    let isSubFrame = false;
+    try {
+      isSubFrame = win.self !== win.top;
+    } catch {
+      isSubFrame = true;
+    }
+    if (!isSubFrame) return false;
+
+    const loc = win.location;
+    if (!loc) return false;
+
+    const host = typeof loc.hostname === 'string' ? loc.hostname : '';
+    const href = typeof loc.href === 'string' ? loc.href : '';
+    if (host && SKIP_IFRAME_HOST_REGEX.test(host)) {
+      return true;
+    }
+    if (href && SKIP_IFRAME_URL_REGEX.test(href)) {
+      return true;
+    }
+    return false;
+  }
+
   // --- 初始化流程 ---
   function init() {
     if (typeof document === 'undefined' || isInitialized) return;
+    if (shouldSkipCurrentFrame()) return;
     isInitialized = true;
 
     // 0. 初始化共用 Constructable Stylesheets
@@ -1821,12 +1891,19 @@
       SLICE_BUDGET_MS,
       PRUNE_TAG_REGEX,
       SKIP_FETCH_HOST_REGEX,
+      SKIP_THIRD_PARTY_FETCH_HOST_REGEX,
+      SKIP_THIRD_PARTY_FETCH_URL_REGEX,
+      SKIP_IFRAME_HOST_REGEX,
+      SKIP_IFRAME_URL_REGEX,
       MAX_FETCH_BYTES,
+      MAX_FAILED_ORIGINS,
+      failedFetchOrigins,
       fontCache,
       neutralFontCache,
       selectorStateCache,
       processedStyleSheets,
       observedRoots,
+      shouldSkipCurrentFrame,
       isIconFont,
       isMonospace,
       isAlreadyPrepended,
