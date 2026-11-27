@@ -273,5 +273,24 @@ describe('字型堆疊解析與前置引擎 (Font Stack Parser & Prepender)', ()
       expect(out).not.toContain("'X'");
       expect(out).not.toContain('.fa-icon');
     });
+
+    it('應忽略含分號與不含分號註解中的假宣告及 content 字串字面量，且不吞掉後方真實規則', () => {
+      const css = [
+        '/* font-family: Arial */ .real{font-family:Roboto}',
+        '.box{/* font-family: Arial; */ color:red} .real2{font-family:Helvetica}',
+        '/* --font-sans: Inter */ :root{--font-sans:Lato}',
+        ':root{/* --font-mono: Courier; */ --font-mono:Consolas}',
+        '.pseudo::before{content:"font-family: Arial;";color:#333}',
+        ".pseudo2::after{content:'--font-sans: Inter;'}"
+      ].join('');
+      const out = extractFontOverrideCss(css);
+      expect(out).toContain(`.real{font-family:${SANS_PREPEND_STR}Roboto;}`);
+      expect(out).toContain(`.real2{font-family:${SANS_PREPEND_STR}Helvetica;}`);
+      expect(out).toContain(`:root{--font-sans:${SANS_PREPEND_STR}Lato;}`);
+      expect(out).toContain(`:root{--font-mono:${MONO_PREPEND_STR}Consolas;}`);
+      expect(out).not.toContain('Arial');
+      expect(out).not.toContain('Inter');
+      expect(out).not.toContain('Courier');
+    });
   });
 });

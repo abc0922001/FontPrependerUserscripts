@@ -1093,4 +1093,62 @@ describe('DOM / CSSOM 與特例整合測試', () => {
     expect(fbStyle.sheet.cssRules[0].style.getPropertyValue('font-family')).toContain('Google Sans');
     expect(fbStyle.sheet.cssRules[299].style.getPropertyValue('font-family')).toContain('Google Sans');
   });
+
+  it('28. 非同步排程遭遇 callback 例外或 scheduler.postTask 拒絕時應安全捕捉，不產生未處理拒絕且不破壞後續排程', async () => {
+    const unhandled = [];
+    const onUnhandled = (reason) => unhandled.push(reason);
+    process.on('unhandledRejection', onUnhandled);
+
+    try {
+      // 1. 無 scheduler 環境 (setTimeout 降級) 遭遇同步例外時應以 rejected Promise 回傳而非未捕捉計時器例外
+      const { exports: fbExports } = createEnvironment();
+      await expect(
+        fbExports.scheduleTaskByPriority(() => {
+          throw new Error('timer callback boom');
+        })
+      ).rejects.toThrow('timer callback boom');
+
+      // 2. scheduler.postTask 首次回傳 rejected Promise 時，不應產生 UnhandledPromiseRejection 且不破壞後續排程
+      let rejectNext = true;
+      const mockScheduler = {
+        postTask: vi.fn((cb) => {
+          if (rejectNext) {
+            rejectNext = false;
+            return Promise.reject(new Error('Task aborted'));
+          }
+          return Promise.resolve().then(() => cb());
+        }),
+        yield: vi.fn(() => Promise.resolve())
+      };
+
+      const { document, exports } = createEnvironment(
+        '<!DOCTYPE html><html><head></head><body></body></html>',
+        (win, doc) => {
+          Object.defineProperty(doc, 'readyState', { configurable: true, get: () => 'complete' });
+        },
+        { sandbox: { scheduler: mockScheduler } }
+      );
+
+      const style1 = document.createElement('style');
+      style1.textContent = '.first-try { font-family: Arial, sans-serif; }';
+      document.head.appendChild(style1);
+
+      // 觸發首輪被拒絕之 scheduleStylesheetBatchScan
+      exports.scheduleStylesheetBatchScan(document, 'user-visible');
+      await new Promise((resolve) => setTimeout(resolve, 20));
+
+      // 後續透過 <link> load 觸發之 scheduleRuleSliceDrain / scheduleStylesheetBatchScan 仍可恢復正常運作
+      const style2 = document.createElement('style');
+      style2.textContent = '.second-try { font-family: Georgia, serif; }';
+      document.head.appendChild(style2);
+
+      exports.scheduleStylesheetBatchScan(document, 'user-visible');
+      await new Promise((resolve) => setTimeout(resolve, 30));
+
+      expect(unhandled.length).toBe(0);
+      expect(style2.sheet.cssRules[0].style.getPropertyValue('font-family')).toContain('Google Sans');
+    } finally {
+      process.off('unhandledRejection', onUnhandled);
+    }
+  });
 });

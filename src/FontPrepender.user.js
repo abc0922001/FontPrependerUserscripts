@@ -924,15 +924,24 @@
       if (varMatch !== null && (fontIdx === -1 || varMatch.index < fontIdx)) {
         const propName = varMatch[0];
         const varIdx = varMatch.index;
+        if (!isFontFamilyVarDecl(propName)) {
+          varMatch = varRegex.exec(cssText);
+          continue;
+        }
+        advanceTo(varIdx);
+        if (cursor > varIdx) {
+          varRegex.lastIndex = cursor;
+          varMatch = varRegex.exec(cssText);
+          continue;
+        }
         let p = varIdx + propName.length;
         while (p < len && cssText.charCodeAt(p) <= 32) p++;
         parseDeclValue(p + 1);
         if (declValEnd > declValStart) {
           const rawVal = cssText.slice(declValStart, declValEnd);
-          if (isFontFamilyVarDecl(propName) && !CSS_SYSTEM_KEYWORDS_REGEX.test(rawVal)) {
+          if (!CSS_SYSTEM_KEYWORDS_REGEX.test(rawVal)) {
             const isMonoVar = /mono|code/i.test(propName) || isMonospace('', rawVal, false);
             if (!isAlreadyPrepended(rawVal, isMonoVar)) {
-              advanceTo(varIdx);
               emitBlock(propName + ':' + (isMonoVar ? MONO_PREPEND_STR : SANS_PREPEND_STR) + rawVal + (declImportant ? '!important;' : ';'));
             }
           }
@@ -958,30 +967,33 @@
         continue;
       }
 
+      advanceTo(idx);
+      if (cursor > idx) {
+        fontIdx = searchStr.indexOf('font-family', cursor);
+        continue;
+      }
+
       parseDeclValue(p + 1);
-      if (declValEnd > declValStart) {
-        advanceTo(idx);
-        if (braceStack.length > 0) {
-          let selector = '';
-          let shouldSkip = false;
-          for (let k = braceStack.length - 1; k >= 0; k--) {
-            const hdr = getHeader(braceStack[k]);
-            if (!hdr) continue;
-            if (hdr.charCodeAt(0) === 64) {
-              if (skipHeaderRegex.test(hdr)) {
-                shouldSkip = true;
-                break;
-              }
-            } else if (!selector) {
-              selector = hdr;
+      if (declValEnd > declValStart && braceStack.length > 0) {
+        let selector = '';
+        let shouldSkip = false;
+        for (let k = braceStack.length - 1; k >= 0; k--) {
+          const hdr = getHeader(braceStack[k]);
+          if (!hdr) continue;
+          if (hdr.charCodeAt(0) === 64) {
+            if (skipHeaderRegex.test(hdr)) {
+              shouldSkip = true;
+              break;
             }
+          } else if (!selector) {
+            selector = hdr;
           }
-          if (!shouldSkip) {
-            const fontVal = cssText.slice(declValStart, declValEnd);
-            const prepended = prependFontFamily(fontVal, selector);
-            if (prepended && prepended !== fontVal) {
-              emitBlock('font-family:' + prepended + (declImportant ? '!important;' : ';'));
-            }
+        }
+        if (!shouldSkip) {
+          const fontVal = cssText.slice(declValStart, declValEnd);
+          const prepended = prependFontFamily(fontVal, selector);
+          if (prepended && prepended !== fontVal) {
+            emitBlock('font-family:' + prepended + (declImportant ? '!important;' : ';'));
           }
         }
       }
@@ -1366,11 +1378,21 @@
     if (typeof window !== 'undefined' && 'scheduler' in window && window.scheduler && typeof window.scheduler.postTask === 'function') {
       return window.scheduler.postTask(callback, { priority });
     }
-    return new Promise((resolve) => {
+    return new Promise((resolve, reject) => {
       if (typeof setTimeout === 'function') {
-        setTimeout(() => resolve(callback()), 0);
+        setTimeout(() => {
+          try {
+            resolve(callback());
+          } catch (err) {
+            reject(err);
+          }
+        }, 0);
       } else {
-        resolve(callback());
+        try {
+          resolve(callback());
+        } catch (err) {
+          reject(err);
+        }
       }
     });
   }
@@ -1418,7 +1440,19 @@
   function scheduleRuleSliceDrain(priority = 'user-visible') {
     if (isRuleBatchScheduled || pendingRuleSlices.length === 0) return;
     isRuleBatchScheduled = true;
-    scheduleTaskByPriority(() => drainPendingRuleSlices(), priority);
+    let started = false;
+    try {
+      Promise.resolve(
+        scheduleTaskByPriority(() => {
+          started = true;
+          return drainPendingRuleSlices();
+        }, priority)
+      ).catch(() => {
+        if (!started) isRuleBatchScheduled = false;
+      });
+    } catch {
+      if (!started) isRuleBatchScheduled = false;
+    }
   }
 
   /**
@@ -1457,7 +1491,11 @@
         return drainPendingRuleSlices();
       }
     };
-    scheduleTaskByPriority(enqueueAll, priority);
+    try {
+      Promise.resolve(scheduleTaskByPriority(enqueueAll, priority)).catch(() => {});
+    } catch {
+      // 忽略排程器同步拒絕例外
+    }
   }
 
   /**
@@ -2616,6 +2654,8 @@
       processStyleSheet,
       processRules,
       scanAndPatchStyleSheets,
+      scheduleTaskByPriority,
+      scheduleStylesheetBatchScan,
       patchElementInlineStyle,
       scanAndPatchInlineStyles,
       patchComputedStyles,
