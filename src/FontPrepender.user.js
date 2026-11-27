@@ -1317,12 +1317,29 @@
   }
 
   /**
+   * 以單次字串屬性讀取快速預篩元素之行內 style 是否可能含有 font 宣告
+   * 避免對 transform / opacity / vertical-align 等無關行內樣式觸發 CSSStyleDeclaration 與 WeakMap 開銷
+   * @param {Element|HTMLElement} el 目標 DOM 元素
+   * @returns {boolean} 是否可能含有字型屬性
+   */
+  function hasFontInStyleAttr(el) {
+    if (!el) return false;
+    if (typeof el.getAttribute === 'function') {
+      const raw = el.getAttribute('style');
+      if (!raw) return false;
+      return raw.indexOf('font') !== -1 || /font/i.test(raw);
+    }
+    return typeof el.hasAttribute !== 'function' || el.hasAttribute('style');
+  }
+
+  /**
    * 處理單一 DOM 元素的行內樣式 font-family（支援 !important 優先級保留）
    * 解決 UNIKO's Hardware 等 CMS 文章標題與連結直接嵌入 style="font-family: ... !important;" 的問題
    * @param {HTMLElement} el 目標 DOM 元素
+   * @returns {boolean} 是否實際寫入並變更了行內樣式
    */
   function patchElementInlineStyle(el) {
-    if (!el || !el.style || typeof el.style.getPropertyValue !== 'function') return;
+    if (!el || !el.style || typeof el.style.getPropertyValue !== 'function') return false;
 
     const style = el.style;
     if (!styleToElementMap.has(style)) {
@@ -1333,12 +1350,12 @@
       ? (style.fontFamily ? style.getPropertyValue('font-family') : '')
       : style.getPropertyValue('font-family');
     if (!inlineFont) {
-      return;
+      return false;
     }
 
     // O(1) 首字元快速前綴檢測：若已前置則立即退出，免除選擇器特徵提取與重複前置運算
     if (isAlreadyPrepended(inlineFont, false) || isAlreadyPrepended(inlineFont, true)) {
-      return;
+      return false;
     }
 
     const selectorHint = getElementSelectorHint(el);
@@ -1350,7 +1367,9 @@
       } else {
         setStylePropertyInternal(style, 'font-family', newFont, priority);
       }
+      return true;
     }
+    return false;
   }
 
   /**
@@ -1923,6 +1942,7 @@
       let shouldScanStylesheets = false;
       let hasAddedElements = false;
       let hasNewComputedCandidates = false;
+      let didMutateStyle = false;
       let modifiedStyleTargets = null;
       let containerSet = null;
 
@@ -1956,46 +1976,70 @@
           }
         }
 
-        // 執行屬性變更批次處理（每元素保證僅執行一次樣式檢查）
+        // 執行屬性變更批次處理（先以 style 字串預篩，每元素保證僅執行一次樣式檢查）
         if (modifiedStyleTargets) {
           modifiedStyleTargets.forEach((el) => {
-            patchElementInlineStyle(el);
+            if (hasFontInStyleAttr(el) && patchElementInlineStyle(el)) {
+              didMutateStyle = true;
+            }
           });
         }
 
-        // 第二趟：直接原地走訪 addedNodes（零中間陣列配置）
+        // 第二趟：直接原地走訪 addedNodes，並將祖先去重自每個節點提升至每個 MutationRecord (O(R*D))
         if (totalAddedCount > 0) {
           const needAncestorCheck = containerSet !== null && totalAddedCount > 1;
+          let lastCheckedTarget = null;
+          let lastTargetCovered = false;
 
           for (let i = 0; i < mutLen; i++) {
             const mutation = mutations[i];
             if (mutation.type !== 'childList') continue;
             const added = mutation.addedNodes;
             const addedLen = added.length;
+            if (addedLen === 0) continue;
+
+            const mutTarget = mutation.target || null;
+            if (needAncestorCheck && mutTarget && mutTarget !== lastCheckedTarget) {
+              let anc = mutTarget;
+              let covered = false;
+              while (anc) {
+                if (containerSet.has(anc)) {
+                  covered = true;
+                  break;
+                }
+                anc = anc.parentNode;
+              }
+              lastCheckedTarget = mutTarget;
+              lastTargetCovered = covered;
+            }
 
             for (let j = 0; j < addedLen; j++) {
               const node = added[j];
               if (!node || node.nodeType !== 1) continue;
               const tagName = node.tagName;
               if (tagName === 'FONT' || tagName === 'font') {
-                if (!node.style || typeof node.style.getPropertyValue !== 'function' || !node.style.getPropertyValue('font-family')) {
+                if (!hasFontInStyleAttr(node)) {
                   continue;
                 }
               }
 
               hasAddedElements = true;
 
-              if (needAncestorCheck && node.parentNode) {
-                let parent = node.parentNode;
-                let hasAncestorInBatch = false;
-                while (parent) {
-                  if (containerSet.has(parent)) {
-                    hasAncestorInBatch = true;
-                    break;
+              if (needAncestorCheck) {
+                if (mutTarget && node.parentNode === mutTarget) {
+                  if (lastTargetCovered) continue;
+                } else if (node.parentNode) {
+                  let parent = node.parentNode;
+                  let hasAncestorInBatch = false;
+                  while (parent) {
+                    if (containerSet.has(parent)) {
+                      hasAncestorInBatch = true;
+                      break;
+                    }
+                    parent = parent.parentNode;
                   }
-                  parent = parent.parentNode;
+                  if (hasAncestorInBatch) continue;
                 }
-                if (hasAncestorInBatch) continue;
               }
 
               // O(1) 剪枝特徵：跳過純腳本、向量圖與非排版標籤
@@ -2027,51 +2071,86 @@
                 }
               } else {
                 // 檢查節點自身行內樣式
-                if (
-                  (typeof node.hasAttribute !== 'function' || node.hasAttribute('style')) &&
-                  node.style &&
-                  typeof node.style.getPropertyValue === 'function' &&
-                  node.style.getPropertyValue('font-family')
-                ) {
-                  patchElementInlineStyle(node);
+                if (hasFontInStyleAttr(node) && patchElementInlineStyle(node)) {
+                  didMutateStyle = true;
                 }
 
-                // 互動期（SPA 動態渲染）與 ShadowRoot：以單次 querySelectorAll 同時掃描子樹行內樣式與樣式表
-                if (node.firstElementChild && typeof node.querySelectorAll === 'function') {
-                  try {
-                    const subItems = node.querySelectorAll('[style*="font-family" i], style, link[rel="stylesheet"]');
-                    const subLen = subItems.length;
-                    for (let k = 0; k < subLen; k++) {
-                      const subNode = subItems[k];
-                      const subTag = subNode.tagName;
-                      if (subTag === 'STYLE' || subTag === 'style') {
-                        if (subNode.sheet) {
-                          processStyleSheet(subNode.sheet);
-                        } else {
-                          shouldScanStylesheets = true;
-                        }
-                      } else if ((subTag === 'LINK' || subTag === 'link') && subNode.rel === 'stylesheet') {
-                        if (subNode.sheet) {
-                          processStyleSheet(subNode.sheet);
-                        } else if (typeof subNode.addEventListener === 'function') {
-                          subNode.addEventListener('load', () => {
-                            if (subNode.sheet) processStyleSheet(subNode.sheet);
-                          }, { once: true });
-                        }
-                      } else {
-                        patchElementInlineStyle(subNode);
-                      }
+                // 淺層容器（<= 8 個直接子元素且無孫代）直接走訪，省去 querySelectorAll 開銷；深層容器改以快速 [style], style, link 查詢
+                const firstChild = node.firstElementChild;
+                if (firstChild) {
+                  let shallowCount = 0;
+                  let hasGrandChild = false;
+                  let childPtr = firstChild;
+                  while (childPtr) {
+                    shallowCount++;
+                    if (childPtr.firstElementChild || shallowCount > 8) {
+                      hasGrandChild = true;
+                      break;
                     }
-                  } catch {
-                    // 容錯防禦
+                    childPtr = childPtr.nextElementSibling;
+                  }
+
+                  if (!hasGrandChild) {
+                    childPtr = firstChild;
+                    while (childPtr) {
+                      const subTag = childPtr.tagName;
+                      if (!OB_PRUNE_TAGS_SET.has(subTag)) {
+                        if (childPtr.shadowRoot) processShadowRoot(childPtr.shadowRoot);
+                        if (subTag === 'STYLE' || subTag === 'style') {
+                          if (childPtr.sheet) processStyleSheet(childPtr.sheet);
+                          else shouldScanStylesheets = true;
+                        } else if ((subTag === 'LINK' || subTag === 'link') && childPtr.rel === 'stylesheet') {
+                          if (childPtr.sheet) processStyleSheet(childPtr.sheet);
+                          else if (typeof childPtr.addEventListener === 'function') {
+                            const linkNode = childPtr;
+                            linkNode.addEventListener('load', () => {
+                              if (linkNode.sheet) processStyleSheet(linkNode.sheet);
+                            }, { once: true });
+                          }
+                        } else if (hasFontInStyleAttr(childPtr) && patchElementInlineStyle(childPtr)) {
+                          didMutateStyle = true;
+                        }
+                      }
+                      childPtr = childPtr.nextElementSibling;
+                    }
+                  } else if (typeof node.querySelectorAll === 'function') {
+                    try {
+                      const subItems = node.querySelectorAll('[style], style, link');
+                      const subLen = subItems.length;
+                      for (let k = 0; k < subLen; k++) {
+                        const subNode = subItems[k];
+                        const subTag = subNode.tagName;
+                        if (subTag === 'STYLE' || subTag === 'style') {
+                          if (subNode.sheet) {
+                            processStyleSheet(subNode.sheet);
+                          } else {
+                            shouldScanStylesheets = true;
+                          }
+                        } else if (subTag === 'LINK' || subTag === 'link') {
+                          if (subNode.rel === 'stylesheet') {
+                            if (subNode.sheet) {
+                              processStyleSheet(subNode.sheet);
+                            } else if (typeof subNode.addEventListener === 'function') {
+                              subNode.addEventListener('load', () => {
+                                if (subNode.sheet) processStyleSheet(subNode.sheet);
+                              }, { once: true });
+                            }
+                          }
+                        } else if (hasFontInStyleAttr(subNode) && patchElementInlineStyle(subNode)) {
+                          didMutateStyle = true;
+                        }
+                      }
+                    } catch {
+                      // 容錯防禦
+                    }
                   }
                 }
               }
             }
           }
         }
-        // 同步清空本輪內部寫回行內樣式所衍生的屬性 MutationRecord 回音，避免觸發第二次多餘微任務喚醒
-        if ((modifiedStyleTargets || hasAddedElements) && typeof observer.takeRecords === 'function') {
+        // 僅於本輪實際改寫過樣式時才同步排空 MutationRecord 回音，消除零寫入批次的無效 takeRecords() 呼叫
+        if (didMutateStyle && typeof observer.takeRecords === 'function') {
           observer.takeRecords();
         }
       } finally {
