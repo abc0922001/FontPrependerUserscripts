@@ -131,8 +131,10 @@
   const MAX_FETCH_BYTES = 1000000; // 1 MB
   const MAX_FAILED_ORIGINS = 200;
 
-  // Computed Style 時間切片預算（毫秒）
+  // Computed Style 與 CSSOM 規則批次讓出時間切片預算（毫秒）
   const SLICE_BUDGET_MS = 4.0;
+  const RULE_SLICE_SIZE = 128;
+  const YIELD_BUDGET_MS = 3.5;
 
   // 選擇器快速特徵篩選正則（自動合併圖示與等寬選擇器特徵，用於 O(1) 快取鍵狀態正規化）
   const SELECTOR_HINT_REGEX = new RegExp(`(?:${ICON_PATTERN_REGEX.source}|${MONO_SELECTOR_REGEX.source})`, 'i');
@@ -225,6 +227,10 @@
 
   // 內部樣式寫入重入防護標記（避免內部 setProperty 觸發原型鏈攔截器二次解析）
   let isInternalStyleWrite = false;
+
+  // CSSOM 批次規則切片佇列（搭配 scheduler.postTask 與 scheduler.yield 拆分主執行緒長任務）
+  const pendingRuleSlices = [];
+  let isRuleBatchScheduled = false;
 
   /**
    * 寫入指定語意狀態之字型快取（達上限時透過持久 MapIterator 執行 O(1) FIFO 單筆淘汰，免除重複建構迭代器）
@@ -1085,53 +1091,67 @@
   }
 
   /**
-   * 遞迴處理 CSS 規則列表（支援媒體查詢、容器查詢與 CSS 變數）
+   * 遞迴處理 CSS 規則列表（支援媒體查詢、容器查詢、CSS 變數與分片讓出主執行緒）
+   * 同步呼叫時保留完整同步行為；透過批次排程呼叫時支援指定規則區間與延遲大群組入列
    * @param {CSSRuleList} rules 規則列表
    * @param {boolean} [hasFontVars=true] 樣式表是否可能含有字型相關 CSS 自訂變數
+   * @param {number} [startIdx=0] 起始規則索引
+   * @param {number} [endIdx=-1] 結束規則索引（-1 代表走訪至尾端）
+   * @param {Array|null} [deferredNestedQueue=null] 批次讓出模式下用於延遲大型巢狀群組之佇列
    */
-  function processRules(rules, hasFontVars = true) {
+  function processRules(rules, hasFontVars = true, startIdx = 0, endIdx = -1, deferredNestedQueue = null) {
     if (!rules) return;
     const len = rules.length;
-    if (len === 0) return;
+    const limit = endIdx < 0 || endIdx > len ? len : endIdx;
+    if (startIdx >= limit) return;
 
     const prevInternal = isInternalStyleWrite;
     isInternalStyleWrite = true;
     try {
-      for (let i = 0; i < len; i++) {
+      for (let i = startIdx; i < limit; i++) {
         const rule = rules[i];
         if (!rule) continue;
 
-        // 標準樣式規則 (CSSStyleRule)
-        if (rule.selectorText && rule.style) {
-          const style = rule.style;
-          // A. 處理常規 font-family
-          // 若環境支援 style.fontFamily 且為空字串，直接 O(1) 短路跳過 getPropertyValue 呼叫
-          const currentFont = typeof style.fontFamily === 'string'
-            ? (style.fontFamily ? style.getPropertyValue('font-family') : '')
-            : style.getPropertyValue('font-family');
-          if (currentFont) {
-            const newFont = prependFontFamily(currentFont, rule.selectorText);
-            if (newFont !== currentFont) {
-              const priority = style.getPropertyPriority('font-family');
-              style.setProperty('font-family', newFont, priority);
-            }
-          }
+        const rType = rule.type;
+        // 快速跳過 @font-face(5)、@keyframes(7)、@keyframe(8)，避免誤改字型註冊或動畫影格
+        if (rType === 5 || rType === 7 || rType === 8) continue;
 
-          // B. 特例三：處理 CSS Custom Properties（例如 --font-sans, --code-font）
-          // 由樣式表層級 hasFontVars 預篩與 style.length 雙重守衛，免除 style.cssText 序列化開銷
-          if (hasFontVars && style.length > 0) {
+        // 標準樣式規則 (CSSStyleRule)
+        if (rType === 1 || rType === undefined) {
+          const style = rule.style;
+          if (style) {
+            // A. 單次讀取 style.fontFamily，僅在非字串環境（如測試替身）才回退 getPropertyValue
+            const rawFont = style.fontFamily;
+            const currentFont = typeof rawFont === 'string'
+              ? rawFont
+              : (typeof style.getPropertyValue === 'function' ? style.getPropertyValue('font-family') : '');
+            // 僅於確定存在字型宣告時才讀取 rule.selectorText，消除 ~95% 無字型規則之 Blink C++ 選擇器序列化
+            if (currentFont) {
+              const sel = rule.selectorText;
+              if (sel) {
+                const newFont = prependFontFamily(currentFont, sel);
+                if (newFont !== currentFont) {
+                  const priority = style.getPropertyPriority('font-family');
+                  style.setProperty('font-family', newFont, priority);
+                }
+              }
+            }
+
+            // B. 特例三：處理 CSS Custom Properties（若僅含單一 font-family 屬性則直接短路）
             const styleLen = style.length;
-            for (let p = 0; p < styleLen; p++) {
-              const propName = style[p];
-              if (propName && propName.charCodeAt(0) === 45 && propName.charCodeAt(1) === 45 && CSS_VAR_FONT_REGEX.test(propName)) {
-                const varVal = style.getPropertyValue(propName);
-                if (varVal && isFontFamilyVarDecl(propName) && !CSS_SYSTEM_KEYWORDS_REGEX.test(varVal.trim())) {
-                  const isMonoVar = /mono|code/i.test(propName) || isMonospace('', varVal, false);
-                  if (!isAlreadyPrepended(varVal, isMonoVar)) {
-                    const prependStr = isMonoVar ? MONO_PREPEND_STR : SANS_PREPEND_STR;
-                    const newVarVal = `${prependStr}${varVal.trim()}`;
-                    const varPriority = style.getPropertyPriority(propName);
-                    style.setProperty(propName, newVarVal, varPriority);
+            if (hasFontVars && styleLen > (currentFont ? 1 : 0)) {
+              for (let p = 0; p < styleLen; p++) {
+                const propName = style[p];
+                if (propName && propName.charCodeAt(0) === 45 && propName.charCodeAt(1) === 45 && isFontFamilyVarDecl(propName)) {
+                  const varVal = style.getPropertyValue(propName);
+                  if (varVal && !CSS_SYSTEM_KEYWORDS_REGEX.test(varVal.trim())) {
+                    const isMonoVar = /mono|code/i.test(propName) || isMonospace('', varVal, false);
+                    if (!isAlreadyPrepended(varVal, isMonoVar)) {
+                      const prependStr = isMonoVar ? MONO_PREPEND_STR : SANS_PREPEND_STR;
+                      const newVarVal = `${prependStr}${varVal.trim()}`;
+                      const varPriority = style.getPropertyPriority(propName);
+                      style.setProperty(propName, newVarVal, varPriority);
+                    }
                   }
                 }
               }
@@ -1139,14 +1159,23 @@
           }
         }
 
-        // 巢狀群組規則（例如 @media, @supports, @container）
-        if (rule.cssRules) {
-          processRules(rule.cssRules, hasFontVars);
+        // 巢狀群組規則（例如 @media, @supports, @container, @layer, CSS Nesting）
+        const nested = rule.cssRules;
+        if (nested && nested.length > 0) {
+          if (deferredNestedQueue !== null && nested.length > RULE_SLICE_SIZE) {
+            deferredNestedQueue.push({ rules: nested, hasFontVars, idx: 0 });
+          } else {
+            processRules(nested, hasFontVars, 0, -1, deferredNestedQueue);
+          }
         }
 
         // @import 匯入之子樣式表 (CSSImportRule)
-        if (rule.styleSheet) {
-          processStyleSheet(rule.styleSheet);
+        if ((rType === 3 || rType === undefined) && rule.styleSheet) {
+          if (deferredNestedQueue !== null) {
+            enqueueStyleSheetForBatch(rule.styleSheet);
+          } else {
+            processStyleSheet(rule.styleSheet);
+          }
         }
       }
     } finally {
@@ -1170,8 +1199,9 @@
   /**
    * 處理單一樣式表（CSSOM）
    * @param {CSSStyleSheet} sheet 樣式表物件
+   * @param {Array|null} [deferredQueue=null] 批次讓出排程佇列（非空時將規則切片推入佇列而非同步掃描）
    */
-  function processStyleSheet(sheet) {
+  function processStyleSheet(sheet, deferredQueue = null) {
     if (!sheet || processedStyleSheets.has(sheet)) {
       return;
     }
@@ -1294,7 +1324,140 @@
     }
 
     processedStyleSheets.add(sheet);
+    if (deferredQueue !== null) {
+      if (rules.length > 0) {
+        deferredQueue.push({ rules, hasFontVars, idx: 0 });
+      }
+      return;
+    }
     processRules(rules, hasFontVars);
+  }
+
+  /**
+   * 以漸進增強特性檢測讓出主執行緒控制權（優先使用 scheduler.yield()，不支援時退回 setTimeout）
+   * @returns {Promise<void>}
+   */
+  function yieldToMain() {
+    if (typeof scheduler !== 'undefined' && typeof scheduler.yield === 'function') {
+      return scheduler.yield();
+    }
+    if (typeof window !== 'undefined' && 'scheduler' in window && window.scheduler && typeof window.scheduler.yield === 'function') {
+      return window.scheduler.yield();
+    }
+    return new Promise((resolve) => {
+      if (typeof setTimeout === 'function') {
+        setTimeout(resolve, 0);
+      } else {
+        resolve();
+      }
+    });
+  }
+
+  /**
+   * 依任務優先級排程執行非阻塞背景任務（優先使用 scheduler.postTask()，不支援時退回 setTimeout）
+   * @param {Function} callback 目標回呼函式
+   * @param {'user-blocking'|'user-visible'|'background'} [priority='user-visible'] 任務優先級
+   * @returns {Promise<*>}
+   */
+  function scheduleTaskByPriority(callback, priority = 'user-visible') {
+    if (typeof scheduler !== 'undefined' && typeof scheduler.postTask === 'function') {
+      return scheduler.postTask(callback, { priority });
+    }
+    if (typeof window !== 'undefined' && 'scheduler' in window && window.scheduler && typeof window.scheduler.postTask === 'function') {
+      return window.scheduler.postTask(callback, { priority });
+    }
+    return new Promise((resolve) => {
+      if (typeof setTimeout === 'function') {
+        setTimeout(() => resolve(callback()), 0);
+      } else {
+        resolve(callback());
+      }
+    });
+  }
+
+  /**
+   * 非同步分片消化待處理之 CSSOM 規則佇列，超過時間預算即透過 yieldToMain() 讓出主執行緒
+   * @returns {Promise<void>}
+   */
+  async function drainPendingRuleSlices() {
+    const nowFn = () => (typeof performance !== 'undefined' && typeof performance.now === 'function' ? performance.now() : Date.now());
+    let deadline = nowFn() + YIELD_BUDGET_MS;
+    try {
+      while (pendingRuleSlices.length > 0) {
+        const task = pendingRuleSlices[0];
+        const total = task.rules.length;
+        if (task.idx >= total) {
+          pendingRuleSlices.shift();
+          continue;
+        }
+        const nextEnd = task.idx + RULE_SLICE_SIZE < total ? task.idx + RULE_SLICE_SIZE : total;
+        const prevIdx = task.idx;
+        task.idx = nextEnd;
+        if (nextEnd >= total) {
+          pendingRuleSlices.shift();
+        }
+        processRules(task.rules, task.hasFontVars, prevIdx, nextEnd, pendingRuleSlices);
+
+        if (pendingRuleSlices.length > 0 && nowFn() >= deadline) {
+          await yieldToMain();
+          deadline = nowFn() + YIELD_BUDGET_MS;
+        }
+      }
+    } finally {
+      isRuleBatchScheduled = false;
+      if (pendingRuleSlices.length > 0) {
+        scheduleRuleSliceDrain('user-visible');
+      }
+    }
+  }
+
+  /**
+   * 觸發規則佇列分片排程（確保同時間僅存在單一排程任務，並於 postTask 內承繼優先級讓出）
+   * @param {'user-blocking'|'user-visible'|'background'} [priority='user-visible'] 任務優先級
+   */
+  function scheduleRuleSliceDrain(priority = 'user-visible') {
+    if (isRuleBatchScheduled || pendingRuleSlices.length === 0) return;
+    isRuleBatchScheduled = true;
+    scheduleTaskByPriority(() => drainPendingRuleSlices(), priority);
+  }
+
+  /**
+   * 將單一動態載入之樣式表加入非同步分片佇列
+   * @param {CSSStyleSheet} sheet 樣式表物件
+   * @param {'user-blocking'|'user-visible'|'background'} [priority='user-visible'] 任務優先級
+   */
+  function enqueueStyleSheetForBatch(sheet, priority = 'user-visible') {
+    processStyleSheet(sheet, pendingRuleSlices);
+    scheduleRuleSliceDrain(priority);
+  }
+
+  /**
+   * 以優先級排程與分片讓出機制批次掃描文件內所有樣式表與 adoptedStyleSheets
+   * @param {Document|ShadowRoot} [docOrRoot=document] 根節點
+   * @param {'user-blocking'|'user-visible'|'background'} [priority='user-visible'] 任務優先級
+   */
+  function scheduleStylesheetBatchScan(docOrRoot = document, priority = 'user-visible') {
+    if (!docOrRoot) return;
+    const enqueueAll = () => {
+      const sheets = docOrRoot.styleSheets;
+      if (sheets) {
+        const count = sheets.length;
+        for (let i = 0; i < count; i++) {
+          processStyleSheet(sheets[i], pendingRuleSlices);
+        }
+      }
+      if (docOrRoot.adoptedStyleSheets && docOrRoot.adoptedStyleSheets.length) {
+        const adopted = docOrRoot.adoptedStyleSheets;
+        for (let i = 0; i < adopted.length; i++) {
+          processStyleSheet(adopted[i], pendingRuleSlices);
+        }
+      }
+      if (pendingRuleSlices.length > 0 && !isRuleBatchScheduled) {
+        isRuleBatchScheduled = true;
+        return drainPendingRuleSlices();
+      }
+    };
+    scheduleTaskByPriority(enqueueAll, priority);
   }
 
   /**
@@ -1388,9 +1551,8 @@
       styleToElementMap.set(style, el);
     }
 
-    const inlineFont = typeof style.fontFamily === 'string'
-      ? (style.fontFamily ? style.getPropertyValue('font-family') : '')
-      : style.getPropertyValue('font-family');
+    const rawInlineFont = style.fontFamily;
+    const inlineFont = typeof rawInlineFont === 'string' ? rawInlineFont : style.getPropertyValue('font-family');
     if (!inlineFont) {
       return false;
     }
@@ -2105,10 +2267,10 @@
                 }
               } else if ((tagName === 'LINK' || tagName === 'link') && node.rel === 'stylesheet') {
                 if (node.sheet) {
-                  processStyleSheet(node.sheet);
+                  enqueueStyleSheetForBatch(node.sheet, 'user-visible');
                 } else if (typeof node.addEventListener === 'function') {
                   node.addEventListener('load', () => {
-                    if (node.sheet) processStyleSheet(node.sheet);
+                    if (node.sheet) enqueueStyleSheetForBatch(node.sheet, 'user-visible');
                   }, { once: true });
                 }
               } else {
@@ -2142,11 +2304,11 @@
                           if (childPtr.sheet) processStyleSheet(childPtr.sheet);
                           else shouldScanStylesheets = true;
                         } else if ((subTag === 'LINK' || subTag === 'link') && childPtr.rel === 'stylesheet') {
-                          if (childPtr.sheet) processStyleSheet(childPtr.sheet);
+                          if (childPtr.sheet) enqueueStyleSheetForBatch(childPtr.sheet, 'user-visible');
                           else if (typeof childPtr.addEventListener === 'function') {
                             const linkNode = childPtr;
                             linkNode.addEventListener('load', () => {
-                              if (linkNode.sheet) processStyleSheet(linkNode.sheet);
+                              if (linkNode.sheet) enqueueStyleSheetForBatch(linkNode.sheet, 'user-visible');
                             }, { once: true });
                           }
                         } else if (hasFontInStyleAttr(childPtr) && patchElementInlineStyle(childPtr)) {
@@ -2171,10 +2333,10 @@
                         } else if (subTag === 'LINK' || subTag === 'link') {
                           if (subNode.rel === 'stylesheet') {
                             if (subNode.sheet) {
-                              processStyleSheet(subNode.sheet);
+                              enqueueStyleSheetForBatch(subNode.sheet, 'user-visible');
                             } else if (typeof subNode.addEventListener === 'function') {
                               subNode.addEventListener('load', () => {
-                                if (subNode.sheet) processStyleSheet(subNode.sheet);
+                                if (subNode.sheet) enqueueStyleSheetForBatch(subNode.sheet, 'user-visible');
                               }, { once: true });
                             }
                           }
@@ -2253,10 +2415,10 @@
       }
       if ((tagName === 'LINK' || tagName === 'link') && node.rel === 'stylesheet') {
         if (node.sheet) {
-          processStyleSheet(node.sheet);
+          enqueueStyleSheetForBatch(node.sheet, 'user-visible');
         } else if (typeof node.addEventListener === 'function') {
           node.addEventListener('load', () => {
-            if (node.sheet) processStyleSheet(node.sheet);
+            if (node.sheet) enqueueStyleSheetForBatch(node.sheet, 'user-visible');
           }, { once: true });
         }
       }
@@ -2312,11 +2474,11 @@
       phase1Observer.observe(observedHead, { childList: true, subtree: true });
     }
 
-    // DOMContentLoaded 階段切換：先卸載 Phase 1、完成一次性 C++ 全頁補齊掃描，再掛載 Phase 2（避免補齊寫入觸發冗餘 MutationRecord）
+    // DOMContentLoaded 階段切換：先卸載 Phase 1、完成一次性行內樣式與 Shadow DOM 補齊，將大批量 CSSOM 交由優先級分片排程執行
     targetDoc.addEventListener('DOMContentLoaded', () => {
       phase1Observer.disconnect();
       injectBaseStyles(targetDoc);
-      scanAndPatchStyleSheets(targetDoc);
+      scheduleStylesheetBatchScan(targetDoc, 'user-visible');
       scanAndPatchInlineStyles(targetDoc);
       scanAndPatchShadowRoots(targetDoc);
       if (hasCorsSheets) {
@@ -2402,9 +2564,10 @@
     // 6. 啟動兩階段動態樣式與行內樣式監聽
     observeStyleSheets(document);
 
-    // 7. window load 完成後若存在跨域樣式表，執行一次 computed style patch
+    // 7. window load 完成後以 background 優先級掃描晚載入樣式表，並在存在跨域樣式表時啟動 computed style patch
     if (typeof window !== 'undefined') {
       window.addEventListener('load', () => {
+        scheduleStylesheetBatchScan(document, 'background');
         if (hasCorsSheets && (!hasInitialComputedSeed || pendingCandidateRoots.length > 0 || computedCursor < computedCandidates.length)) {
           scheduleIdleComputedStylePatch();
         }

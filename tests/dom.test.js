@@ -939,4 +939,158 @@ describe('DOM / CSSOM 與特例整合測試', () => {
     expect(rootStyle.getPropertyValue('--font-weight-bold').trim()).toBe('700');
     expect(rootStyle.getPropertyValue('--font-display').trim()).toBe('swap');
   });
+
+  it('26. processRules 應跳過 @font-face/@keyframes、無字型規則不觸發 selectorText 序列化且忽略空 cssRules (Round 5B)', () => {
+    const { exports } = createEnvironment();
+    let selectorGetterCalls = 0;
+    let fontRuleFont = 'Arial, sans-serif';
+    let fontFaceFont = 'MyCustomWebFont';
+
+    const mockRules = [
+      {
+        type: 5, // @font-face
+        get selectorText() {
+          selectorGetterCalls++;
+          return '';
+        },
+        style: {
+          fontFamily: fontFaceFont,
+          getPropertyValue: (p) => (p === 'font-family' ? fontFaceFont : ''),
+          getPropertyPriority: () => '',
+          setProperty: (p, v) => { if (p === 'font-family') fontFaceFont = v; },
+          length: 1
+        }
+      },
+      {
+        type: 7, // @keyframes
+        get selectorText() {
+          selectorGetterCalls++;
+          return 'fadeIn';
+        },
+        cssRules: { length: 0 }
+      },
+      {
+        type: 1,
+        get selectorText() {
+          selectorGetterCalls++;
+          return '.no-font-rule';
+        },
+        style: {
+          fontFamily: '',
+          length: 0
+        },
+        cssRules: { length: 0 }
+      },
+      {
+        type: 1,
+        get selectorText() {
+          selectorGetterCalls++;
+          return '.has-font-rule';
+        },
+        style: {
+          fontFamily: fontRuleFont,
+          getPropertyPriority: () => '',
+          setProperty: (p, v) => { if (p === 'font-family') fontRuleFont = v; },
+          length: 1
+        }
+      }
+    ];
+
+    exports.processRules(mockRules, false);
+
+    expect(selectorGetterCalls).toBe(1);
+    expect(fontFaceFont).toBe('MyCustomWebFont');
+    expect(fontRuleFont).toContain('Google Sans');
+  });
+
+  it('27. DOMContentLoaded 批次樣式掃描應優先使用 scheduler.postTask 與 scheduler.yield 拆分大型樣式表，並在無 scheduler 時平滑降級 (Round 5B)', async () => {
+    let controlledState = 'loading';
+    let triggerDCL = null;
+    const postTaskCalls = [];
+    let yieldCalls = 0;
+    let fakeNow = 0;
+
+    const mockScheduler = {
+      postTask: vi.fn((cb, opts) => {
+        postTaskCalls.push(opts?.priority);
+        return Promise.resolve().then(() => cb());
+      }),
+      yield: vi.fn(() => {
+        yieldCalls++;
+        fakeNow = 0;
+        return Promise.resolve();
+      })
+    };
+
+    const { document } = createEnvironment(
+      '<!DOCTYPE html><html><head></head><body></body></html>',
+      (win, doc) => {
+        Object.defineProperty(doc, 'readyState', { configurable: true, get: () => controlledState });
+        const origAdd = doc.addEventListener.bind(doc);
+        doc.addEventListener = (type, listener, opts) => {
+          if (type === 'DOMContentLoaded') {
+            triggerDCL = listener;
+            return;
+          }
+          return origAdd(type, listener, opts);
+        };
+      },
+      {
+        sandbox: {
+          scheduler: mockScheduler,
+          performance: {
+            now: () => {
+              fakeNow += 2.5;
+              return fakeNow;
+            }
+          }
+        }
+      }
+    );
+
+    const styleEl = document.createElement('style');
+    const lines = [];
+    for (let i = 0; i < 300; i++) {
+      lines.push(`.batch-${i} { font-family: Arial, sans-serif; }`);
+    }
+    styleEl.textContent = lines.join('\n');
+    document.head.appendChild(styleEl);
+
+    controlledState = 'interactive';
+    triggerDCL();
+    await new Promise((resolve) => setTimeout(resolve, 30));
+
+    expect(postTaskCalls).toContain('user-visible');
+    expect(yieldCalls).toBeGreaterThanOrEqual(1);
+    expect(styleEl.sheet.cssRules[0].style.getPropertyValue('font-family')).toContain('Google Sans');
+    expect(styleEl.sheet.cssRules[299].style.getPropertyValue('font-family')).toContain('Google Sans');
+
+    // 驗證無 scheduler API 環境下（fallback 至 setTimeout）仍能正常完成分片改寫
+    let fbState = 'loading';
+    let fbDCL = null;
+    const fbEnv = createEnvironment(
+      '<!DOCTYPE html><html><head></head><body></body></html>',
+      (win, doc) => {
+        Object.defineProperty(doc, 'readyState', { configurable: true, get: () => fbState });
+        const origAdd = doc.addEventListener.bind(doc);
+        doc.addEventListener = (type, listener, opts) => {
+          if (type === 'DOMContentLoaded') {
+            fbDCL = listener;
+            return;
+          }
+          return origAdd(type, listener, opts);
+        };
+      }
+    );
+    const fbStyle = fbEnv.document.createElement('style');
+    fbStyle.textContent = lines.join('\n');
+    fbEnv.document.head.appendChild(fbStyle);
+
+    fbState = 'interactive';
+    fbDCL();
+    await new Promise((resolve) => setTimeout(resolve, 40));
+
+    expect(fbStyle.sheet.cssRules[0].style.getPropertyValue('font-family')).toContain('Google Sans');
+    expect(fbStyle.sheet.cssRules[299].style.getPropertyValue('font-family')).toContain('Google Sans');
+  });
 });
