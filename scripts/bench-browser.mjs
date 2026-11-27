@@ -1,4 +1,4 @@
-import { spawn } from 'node:child_process';
+import { execFileSync, spawn } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -27,13 +27,18 @@ function parseArgs(argv) {
     headless: false,
     rounds: 3,
     sites: SITES.map((s) => s.key),
-    out: null
+    out: null,
+    gitRef: null
   };
-  for (const arg of argv) {
+  for (let i = 0; i < argv.length; i++) {
+    const arg = argv[i];
     if (arg === '--headless') opts.headless = true;
     else if (arg.startsWith('--rounds=')) opts.rounds = Math.max(1, parseInt(arg.slice(9), 10) || 3);
     else if (arg.startsWith('--sites=')) opts.sites = arg.slice(8).split(',').map((s) => s.trim()).filter(Boolean);
     else if (arg.startsWith('--out=')) opts.out = arg.slice(6);
+    else if (arg === '--out' && argv[i + 1]) opts.out = argv[++i];
+    else if (arg.startsWith('--git-ref=')) opts.gitRef = arg.slice(10);
+    else if (arg === '--git-ref' && argv[i + 1]) opts.gitRef = argv[++i];
   }
   return opts;
 }
@@ -248,20 +253,49 @@ function buildLoafObserverScript() {
 function analyzeTrace(events) {
   let targetPid = null;
   let targetTid = null;
+  let commitMainPid = null;
+  let commitMainTid = null;
+  let parseHtmlPid = null;
+  let parseHtmlTid = null;
   const rendererThreads = new Map();
 
   for (let i = 0; i < events.length; i++) {
     const e = events[i];
+    if (e.ph === 'M' && e.name === 'thread_name' && e.args?.name === 'CrRendererMain') {
+      rendererThreads.set(e.pid, e.tid);
+    }
+    if (
+      e.name === 'CommitLoad' &&
+      e.args?.data?.isOutermostMainFrame === true &&
+      typeof e.args?.data?.url === 'string' &&
+      e.args.data.url.startsWith('http')
+    ) {
+      commitMainPid = e.pid;
+      commitMainTid = e.tid;
+    }
+    if (
+      e.name === 'ParseHTML' &&
+      typeof e.args?.beginData?.url === 'string' &&
+      e.args.beginData.url.startsWith('http')
+    ) {
+      if (parseHtmlPid === null) {
+        parseHtmlPid = e.pid;
+        parseHtmlTid = e.tid;
+      }
+    }
     if (e.name === 'TracingStartedInBrowser' && e.args?.data?.frames) {
       const mainFrame = e.args.data.frames.find((f) => !f.parent) || e.args.data.frames[0];
       if (mainFrame?.processId) targetPid = mainFrame.processId;
     }
-    if (e.ph === 'M' && e.name === 'thread_name' && e.args?.name === 'CrRendererMain') {
-      rendererThreads.set(e.pid, e.tid);
-    }
   }
 
-  if (targetPid && rendererThreads.has(targetPid)) {
+  if (commitMainPid !== null) {
+    targetPid = commitMainPid;
+    targetTid = rendererThreads.get(commitMainPid) ?? commitMainTid;
+  } else if (parseHtmlPid !== null) {
+    targetPid = parseHtmlPid;
+    targetTid = rendererThreads.get(parseHtmlPid) ?? parseHtmlTid;
+  } else if (targetPid && rendererThreads.has(targetPid)) {
     targetTid = rendererThreads.get(targetPid);
   } else {
     // fallback: pick the CrRendererMain with most UpdateLayoutTree / Layout events
@@ -694,7 +728,9 @@ function aggregateRuns(runs) {
 async function main() {
   const opts = parseArgs(process.argv.slice(2));
   const userscriptPath = new URL('../src/FontPrepender.user.js', import.meta.url);
-  const userscriptCode = fs.readFileSync(userscriptPath, 'utf8');
+  const userscriptCode = opts.gitRef
+    ? execFileSync('git', ['show', `${opts.gitRef}:src/FontPrepender.user.js`], { encoding: 'utf8' })
+    : fs.readFileSync(userscriptPath, 'utf8');
   const selectedSites = SITES.filter((s) => opts.sites.includes(s.key));
 
   const { proc, wsUrl, userDataDir } = await launchChrome(opts.headless);
