@@ -37,14 +37,7 @@ function measureMedian(fn, { runs = 5, beforeEach } = {}) {
   };
 }
 
-async function measureMedianAsync(fn, { runs = 5, beforeEach } = {}) {
-  const samples = [];
-  for (let r = 0; r < runs; r++) {
-    if (beforeEach) await beforeEach(r);
-    const start = performance.now();
-    await fn(r);
-    samples.push(performance.now() - start);
-  }
+function summarizeSamples(samples) {
   const sorted = [...samples].sort((a, b) => a - b);
   return {
     median: sorted[Math.floor(sorted.length / 2)],
@@ -287,8 +280,9 @@ console.log('====================================================\n');
   let zeroWriteTakeRecordsCalls = 0;
 
   // R2-A：多層巢狀容器批次插入 (60 張 4 層卡片 = ~1,200 節點，含混合父/子 addedNodes 與 SVG 剪枝)
+  // 配置 6 組隔離 JSDOM（1 組 JIT 預熱 + 5 組計時中位數），完全以微任務刷新取代 setTimeout
   const r2aBatches = [];
-  for (let r = 0; r < 5; r++) {
+  for (let r = 0; r < 6; r++) {
     const dom = new JSDOM('<!DOCTYPE html><html><head></head><body><main id="feed"></main></body></html>');
     const { window } = dom;
     const { document, Element, HTMLElement, MutationObserver, CSSStyleSheet, CSSStyleDeclaration } = window;
@@ -297,11 +291,23 @@ console.log('====================================================\n');
     const OrigMO = MutationObserver;
     let activeObs = null;
     let callbackCount = 0;
+    let cbDurationMs = 0;
+    let notifyFlush = null;
     class TrackedMO extends OrigMO {
       constructor(cb) {
         super((muts, obs) => {
           callbackCount++;
-          return cb(muts, obs);
+          const t0 = performance.now();
+          try {
+            return cb(muts, obs);
+          } finally {
+            cbDurationMs += performance.now() - t0;
+            if (notifyFlush) {
+              const fn = notifyFlush;
+              notifyFlush = null;
+              fn();
+            }
+          }
         });
         activeObs = this;
       }
@@ -365,44 +371,95 @@ console.log('====================================================\n');
       feed,
       cards,
       getCallbackCount: () => callbackCount,
-      resetCallbackCount: () => {
+      getCbDuration: () => cbDurationMs,
+      resetCounters: () => {
         callbackCount = 0;
+        cbDurationMs = 0;
       },
+      waitForObserverFlush: () =>
+        new Promise((resolve) => {
+          notifyFlush = resolve;
+          queueMicrotask(() =>
+            queueMicrotask(() => {
+              if (notifyFlush) {
+                const fn = notifyFlush;
+                notifyFlush = null;
+                fn();
+              }
+            })
+          );
+        }),
       activeObs
     });
   }
 
-  const r2a = await measureMedianAsync(
-    async (r) => {
-      const b = r2aBatches[r];
-      b.resetCallbackCount();
-      for (let i = 0; i < b.cards.length; i++) {
-        b.feed.appendChild(b.cards[i].article);
-        // 混合同一批次內之子節點附加，觸發 containerSet 祖先檢查路徑
-        if (i % 4 === 0) {
-          const extra = b.feed.ownerDocument.createElement('span');
-          extra.setAttribute('style', 'font-family: Georgia, serif;');
-          b.cards[i].bodyDiv.appendChild(extra);
-        }
+  async function runR2aBatch(b) {
+    b.resetCounters();
+    const turnStart = performance.now();
+    for (let i = 0; i < b.cards.length; i++) {
+      b.feed.appendChild(b.cards[i].article);
+      // 混合同一批次內之子節點附加，觸發 containerSet 祖先檢查路徑
+      if (i % 4 === 0) {
+        const extra = b.feed.ownerDocument.createElement('span');
+        extra.setAttribute('style', 'font-family: Georgia, serif;');
+        b.cards[i].bodyDiv.appendChild(extra);
       }
-      await new Promise((resolve) => setTimeout(resolve, 0));
-    },
-    { runs: 5 }
-  );
+    }
+    await b.waitForObserverFlush();
+    return {
+      cbMs: b.getCbDuration(),
+      turnMs: performance.now() - turnStart
+    };
+  }
+
+  // JIT 預熱（不計入統計）
+  await runR2aBatch(r2aBatches[0]);
+  const r2aCbSamples = [];
+  const r2aTurnSamples = [];
+  for (let r = 1; r <= 5; r++) {
+    const res = await runR2aBatch(r2aBatches[r]);
+    r2aCbSamples.push(res.cbMs);
+    r2aTurnSamples.push(res.turnMs);
+  }
+  const r2aCallback = summarizeSamples(r2aCbSamples);
+  const r2aTurn = summarizeSamples(r2aTurnSamples);
 
   // R2-B：高頻 attributes: style 變動 (500 次，90% 非字型屬性)
   const r2bEnvs = [];
-  for (let r = 0; r < 5; r++) {
+  for (let r = 0; r < 6; r++) {
     const dom = new JSDOM('<!DOCTYPE html><html><head></head><body><div id="stage"></div></body></html>');
     const { window } = dom;
     const { document, Element, HTMLElement, MutationObserver, CSSStyleSheet, CSSStyleDeclaration } = window;
     Object.defineProperty(document, 'readyState', { configurable: true, get: () => 'complete' });
+
+    const OrigMO = MutationObserver;
+    let cbDurationMs = 0;
+    let notifyFlush = null;
+    class TimedMO extends OrigMO {
+      constructor(cb) {
+        super((muts, obs) => {
+          const t0 = performance.now();
+          try {
+            return cb(muts, obs);
+          } finally {
+            cbDurationMs += performance.now() - t0;
+            if (notifyFlush) {
+              const fn = notifyFlush;
+              notifyFlush = null;
+              fn();
+            }
+          }
+        });
+      }
+    }
+    window.MutationObserver = TimedMO;
+
     loadUserscript({
       window,
       document,
       Element,
       HTMLElement,
-      MutationObserver,
+      MutationObserver: TimedMO,
       CSSStyleSheet,
       CSSStyleDeclaration
     });
@@ -416,28 +473,62 @@ console.log('====================================================\n');
       stage.appendChild(el);
       els.push(el);
     }
-    r2bEnvs.push({ els });
+    const waitForObserverFlush = () =>
+      new Promise((resolve) => {
+        notifyFlush = resolve;
+        queueMicrotask(() =>
+          queueMicrotask(() => {
+            if (notifyFlush) {
+              const fn = notifyFlush;
+              notifyFlush = null;
+              fn();
+            }
+          })
+        );
+      });
+    // 以微任務清空初始 childList 佇列（零 setTimeout）
+    await waitForObserverFlush();
+    r2bEnvs.push({
+      els,
+      getCbDuration: () => cbDurationMs,
+      resetCounters: () => {
+        cbDurationMs = 0;
+      },
+      waitForObserverFlush
+    });
   }
-  // 先清空初始 childList 隊列
-  await new Promise((resolve) => setTimeout(resolve, 10));
 
-  const r2b = await measureMedianAsync(
-    async (r) => {
-      const { els } = r2bEnvs[r];
-      for (let m = 0; m < 500; m++) {
-        const idx = m % 150;
-        if (idx < 135) {
-          els[idx].setAttribute('style', `transform: translateY(${m}px); opacity: 0.9;`);
-        } else if (idx < 143) {
-          els[idx].setAttribute('style', 'font-family: "Google Sans", "Google Sans Flex", "Noto Sans CJK TC", Arial; color: red;');
-        } else {
-          els[idx].setAttribute('style', 'font-family: Verdana, sans-serif;');
-        }
+  async function runR2bBatch(env) {
+    env.resetCounters();
+    const turnStart = performance.now();
+    for (let m = 0; m < 500; m++) {
+      const idx = m % 150;
+      if (idx < 135) {
+        env.els[idx].setAttribute('style', `transform: translateY(${m}px); opacity: 0.9;`);
+      } else if (idx < 143) {
+        env.els[idx].setAttribute('style', 'font-family: "Google Sans", "Google Sans Flex", "Noto Sans CJK TC", Arial; color: red;');
+      } else {
+        env.els[idx].setAttribute('style', 'font-family: Verdana, sans-serif;');
       }
-      await new Promise((resolve) => setTimeout(resolve, 0));
-    },
-    { runs: 5 }
-  );
+    }
+    await env.waitForObserverFlush();
+    return {
+      cbMs: env.getCbDuration(),
+      turnMs: performance.now() - turnStart
+    };
+  }
+
+  // JIT 預熱（不計入統計）
+  await runR2bBatch(r2bEnvs[0]);
+  const r2bCbSamples = [];
+  const r2bTurnSamples = [];
+  for (let r = 1; r <= 5; r++) {
+    const res = await runR2bBatch(r2bEnvs[r]);
+    r2bCbSamples.push(res.cbMs);
+    r2bTurnSamples.push(res.turnMs);
+  }
+  const r2bCallback = summarizeSamples(r2bCbSamples);
+  const r2bTurn = summarizeSamples(r2bTurnSamples);
 
   // R2-C：takeRecords() 回音抑制與零寫入空呼叫驗證
   const echoDom = new JSDOM('<!DOCTYPE html><html><head></head><body><div id="echo-root"></div></body></html>');
@@ -493,16 +584,20 @@ console.log('====================================================\n');
   zeroWriteTakeRecordsCalls = echoZeroWriteCalls;
 
   results.R2 = {
-    nestedContainerMedianMs: r2a.median,
-    attrStyleBurstMedianMs: r2b.median,
+    nestedContainerCallbackMedianMs: r2aCallback.median,
+    nestedContainerTurnMedianMs: r2aTurn.median,
+    attrStyleCallbackMedianMs: r2bCallback.median,
+    attrStyleTurnMedianMs: r2bTurn.median,
     echoCallbacksOnSelfWrite: echoCallbacksAfterSelfWrite,
     drainedEchoRecords: echoDrained,
     zeroWriteTakeRecordsCalls
   };
 
-  console.log('[R2] 真實 MutationObserver 壓測：');
-  console.log(`  - R2-A 60 張 4 層巢狀容器 (~1,200 節點)：${fmtStat(r2a)}`);
-  console.log(`  - R2-B 500 次 style 屬性變動 (90% 非字型)：${fmtStat(r2b)}`);
+  console.log('[R2] 真實 MutationObserver 壓測（微任務刷新，零計時器抖動）：');
+  console.log(`  - R2-A 60 張 4 層巢狀容器 callback 耗時：${fmtStat(r2aCallback)}`);
+  console.log(`    (含 JSDOM 建樹微任務總耗時參考)      ：${fmtStat(r2aTurn)}`);
+  console.log(`  - R2-B 500 次 style 變動 callback 耗時  ：${fmtStat(r2bCallback)}`);
+  console.log(`    (含 JSDOM setAttribute 微任務總耗時)   ：${fmtStat(r2bTurn)}`);
   console.log(
     `  - R2-C takeRecords() 回音驗證：自寫入喚醒次數=${echoCallbacksAfterSelfWrite} (預期=1), 已排空回音=${echoDrained}, 零寫入批次 takeRecords 呼叫=${zeroWriteTakeRecordsCalls}\n`
   );

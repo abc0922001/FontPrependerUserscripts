@@ -312,14 +312,28 @@ function analyzeTrace(events) {
     }
   }
 
-  jsWindows.sort((a, b) => a[0] - b[0]);
+  jsWindows.sort((a, b) => a[0] - b[0] || b[1] - a[1]);
+  const mergedJsWindows = [];
+  for (let i = 0; i < jsWindows.length; i++) {
+    const [s, e] = jsWindows[i];
+    if (mergedJsWindows.length === 0) {
+      mergedJsWindows.push([s, e]);
+    } else {
+      const last = mergedJsWindows[mergedJsWindows.length - 1];
+      if (s <= last[1]) {
+        if (e > last[1]) last[1] = e;
+      } else {
+        mergedJsWindows.push([s, e]);
+      }
+    }
+  }
 
   function isInsideJs(ts) {
     let lo = 0;
-    let hi = jsWindows.length - 1;
+    let hi = mergedJsWindows.length - 1;
     while (lo <= hi) {
       const mid = (lo + hi) >> 1;
-      const [s, e] = jsWindows[mid];
+      const [s, e] = mergedJsWindows[mid];
       if (ts < s) hi = mid - 1;
       else if (ts > e) lo = mid + 1;
       else return true;
