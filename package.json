@@ -1,6 +1,6 @@
 {
   "name": "fontprependeruserscripts",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "High performance Userscript prepending custom fonts to web pages without breaking layouts or icon fonts",
   "type": "module",
   "scripts": {
