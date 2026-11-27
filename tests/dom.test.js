@@ -2,6 +2,7 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { JSDOM } from 'jsdom';
 import fs from 'node:fs';
 import vm from 'node:vm';
+import { performance } from 'node:perf_hooks';
 
 function createEnvironment(html = '<!DOCTYPE html><html><head></head><body></body></html>', beforeInit, options = {}) {
   const dom = new JSDOM(html, {
@@ -861,5 +862,66 @@ describe('DOM / CSSOM 與特例整合測試', () => {
     );
     expect(disqusEnv.exports.getIsInitialized()).toBe(true);
     expect(disqusEnv.document.querySelector('#font-prepender-base-style')).not.toBeNull();
+  });
+
+  it('23. 條件式剖析器於未啟用 fp-profile 時應保持零開銷且不建立 window.__fpProf', () => {
+    const { window } = createEnvironment();
+    expect(window.__fpProf).toBeUndefined();
+  });
+
+  it('24. 啟用 fp-profile=1 時應準確記錄 9 個核心熱點之呼叫次數與耗時，且巢狀 @media 不重複計時', async () => {
+    const { document, exports, window } = createEnvironment(
+      '<!DOCTYPE html><html><head><style>@media screen { .nested { font-family: Arial, sans-serif; } }</style></head><body><div id="inline-box" style="font-family: Helvetica, sans-serif;">Hello</div></body></html>',
+      (win, doc) => {
+        Object.defineProperty(doc, 'readyState', { configurable: true, get: () => 'complete' });
+      },
+      {
+        sandbox: {
+          localStorage: {
+            getItem: (key) => (key === 'fp-profile' ? '1' : null)
+          },
+          performance
+        }
+      }
+    );
+
+    expect(window.__fpProf).toBeDefined();
+
+    // 觸發尚未於 init() 執行之熱點：rewriteCssContent、patchComputedStyles 與 phase2Observer
+    exports.rewriteCssContent('.card { font-family: Arial, sans-serif; }');
+
+    window.getComputedStyle = () => ({ fontFamily: 'Georgia, serif' });
+    const h2 = document.createElement('h2');
+    h2.textContent = 'Headline';
+    document.body.appendChild(h2);
+    exports.patchComputedStyles();
+
+    // 等待 phase2Observer 微任務處理剛剛插入之 h2 與新增行內樣式節點
+    const dynamicSpan = document.createElement('span');
+    dynamicSpan.setAttribute('style', 'font-family: Verdana, sans-serif;');
+    document.body.appendChild(dynamicSpan);
+    await new Promise((resolve) => setTimeout(resolve, 30));
+
+    const expectedHotspots = [
+      'prependFontFamily',
+      'rewriteCssContent',
+      'processStyleSheet',
+      'processRules',
+      'scanAndPatchInlineStyles',
+      'patchElementInlineStyle',
+      'patchComputedStyles',
+      'scanAndPatchShadowRoots',
+      'phase2Observer'
+    ];
+
+    for (const key of expectedHotspots) {
+      expect(window.__fpProf.n[key]).toBeGreaterThanOrEqual(1);
+      expect(typeof window.__fpProf.t[key]).toBe('number');
+      expect(window.__fpProf.t[key]).toBeGreaterThanOrEqual(0);
+    }
+
+    // 巢狀 @media 應使 processRules 呼叫次數 >= 2，且重入深度歸零無重複計時
+    expect(window.__fpProf.n.processRules).toBeGreaterThanOrEqual(2);
+    expect(window.__fpProf.d.processRules).toBe(0);
   });
 });

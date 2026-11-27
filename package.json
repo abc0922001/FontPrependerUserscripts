@@ -6,6 +6,8 @@
   "scripts": {
     "test": "vitest run",
     "bench": "node tests/benchmark.perf.js",
+    "bench:realistic": "node tests/benchmark.realistic.perf.js",
+    "bench:browser": "node scripts/bench-browser.mjs",
     "check": "node scripts/check.js"
   },
   "repository": {

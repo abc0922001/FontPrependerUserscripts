@@ -44,15 +44,20 @@
       return false;
     }
   })();
-  const prof = PROFILE ? { t: Object.create(null), n: Object.create(null) } : null;
+  const prof = PROFILE ? { t: Object.create(null), n: Object.create(null), d: Object.create(null) } : null;
   const wrap = (name, fn) => {
     if (!PROFILE) return fn;
     return function(...args) {
-      const start = performance.now();
+      const depth = prof.d[name] || 0;
+      prof.d[name] = depth + 1;
+      const start = depth === 0 ? performance.now() : 0;
       try {
         return fn.apply(this, args);
       } finally {
-        prof.t[name] = (prof.t[name] || 0) + (performance.now() - start);
+        prof.d[name] = depth;
+        if (depth === 0) {
+          prof.t[name] = (prof.t[name] || 0) + (performance.now() - start);
+        }
         prof.n[name] = (prof.n[name] || 0) + 1;
       }
     };
@@ -1520,7 +1525,7 @@
       return;
     }
 
-    const observer = new MutationObserver((mutations) => {
+    const observer = new MutationObserver(wrap('phase2Observer', (mutations) => {
       let shouldScanStylesheets = false;
       let hasAddedElements = false;
       let modifiedStyleTargets = null;
@@ -1680,7 +1685,7 @@
       if (hasAddedElements && hasCorsSheets) {
         scheduleIdleComputedStylePatch();
       }
-    });
+    }));
 
     observer.observe(targetNode, {
       childList: true,
@@ -1832,6 +1837,17 @@
       return true;
     }
     return false;
+  }
+
+  if (PROFILE) {
+    prependFontFamily = wrap('prependFontFamily', prependFontFamily);
+    rewriteCssContent = wrap('rewriteCssContent', rewriteCssContent);
+    processStyleSheet = wrap('processStyleSheet', processStyleSheet);
+    processRules = wrap('processRules', processRules);
+    scanAndPatchInlineStyles = wrap('scanAndPatchInlineStyles', scanAndPatchInlineStyles);
+    patchElementInlineStyle = wrap('patchElementInlineStyle', patchElementInlineStyle);
+    patchComputedStyles = wrap('patchComputedStyles', patchComputedStyles);
+    scanAndPatchShadowRoots = wrap('scanAndPatchShadowRoots', scanAndPatchShadowRoots);
   }
 
   // --- 初始化流程 ---

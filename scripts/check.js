@@ -6,7 +6,9 @@ const targetFiles = [
   'tests/parser.test.js',
   'tests/dom.test.js',
   'tests/sites.test.js',
-  'tests/benchmark.perf.js'
+  'tests/benchmark.perf.js',
+  'tests/benchmark.realistic.perf.js',
+  'scripts/bench-browser.mjs'
 ];
 
 let hasErrors = false;
