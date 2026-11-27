@@ -164,10 +164,26 @@
   let sharedBaseSheet = null;
   let sharedEditorSheet = null;
 
-  // Computed Style 候選節點增量佇列與游標
+  // Computed Style 候選節點增量佇列、游標與捲動延遲狀態
+  const COMPUTED_CANDIDATE_SELECTOR =
+    'h1, h2, h3, h4, h5, h6, [class*="title"], [class*="heading"], [class*="card"] a, [class*="post"] a, main, article, section, header, p, code, pre, [class*="content"], [class*="editor"], time, [class*="date"], [class*="meta"], [class*="author"], [class*="byline"], [class*="time"], [class*="published"]';
+  const CANDIDATE_TAG_SET = new Set([
+    'H1', 'H2', 'H3', 'H4', 'H5', 'H6', 'MAIN', 'ARTICLE', 'SECTION', 'HEADER', 'P', 'CODE', 'PRE', 'TIME', 'A',
+    'h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'main', 'article', 'section', 'header', 'p', 'code', 'pre', 'time', 'a'
+  ]);
+  const CANDIDATE_CLASS_FAST_REGEX = /title|heading|card|post|content|editor|date|meta|author|byline|time|published/i;
   let computedCandidates = [];
   let computedCandidateSet = new WeakSet();
   let computedCursor = 0;
+  let pendingCandidateRoots = [];
+  const pendingCandidateRootSet = new WeakSet();
+  const rootToObserverMap = new WeakMap();
+  let hasInitialComputedSeed = false;
+  let isRunningScheduledPatch = false;
+  let isUserScrolling = false;
+  let hasDeferredIdlePatch = false;
+  let scrollEndFallbackTimer = null;
+  let isScrollGuardAttached = false;
 
   // 初始化與 Hook 狀態旗標（保證冪等性）
   let isInitialized = false;
@@ -1157,25 +1173,149 @@
   }
 
   /**
+   * 將單一 DOM 元素去重後加入 Computed Style 候選佇列
+   * @param {Element} el 候選元素
+   * @returns {boolean} 是否成功加入
+   */
+  function enqueueComputedCandidate(el) {
+    if (!el || processedElements.has(el) || computedCandidateSet.has(el) || isTranslationNode(el)) {
+      return false;
+    }
+    computedCandidateSet.add(el);
+    computedCandidates.push(el);
+    return true;
+  }
+
+  /**
+   * 於 MutationObserver 階段以 O(1) 預篩將新增節點加入待展開計算樣式根節點佇列
+   * @param {Element} node 新增元素節點
+   * @returns {boolean} 是否可能含有候選元素
+   */
+  function queueAddedCandidateRoot(node) {
+    if (!node || processedElements.has(node) || pendingCandidateRootSet.has(node) || isTranslationNode(node)) {
+      return false;
+    }
+    if (!node.firstElementChild) {
+      const cls = node.className;
+      const isCandidateLeaf =
+        CANDIDATE_TAG_SET.has(node.tagName) ||
+        (typeof cls === 'string' && cls.length > 0 && CANDIDATE_CLASS_FAST_REGEX.test(cls));
+      if (!isCandidateLeaf) {
+        return false;
+      }
+    }
+    pendingCandidateRootSet.add(node);
+    pendingCandidateRoots.push(node);
+    return true;
+  }
+
+  /**
+   * 消化增量新增之待展開根節點，僅針對新增子樹補入候選佇列（避免全頁重掃）
+   */
+  function drainPendingCandidateRoots() {
+    if (pendingCandidateRoots.length === 0) return;
+    const roots = pendingCandidateRoots;
+    pendingCandidateRoots = [];
+    for (let i = 0; i < roots.length; i++) {
+      const root = roots[i];
+      if (!root || root.isConnected === false) continue;
+      if (typeof root.matches === 'function' && root.matches(COMPUTED_CANDIDATE_SELECTOR)) {
+        enqueueComputedCandidate(root);
+      }
+      if (root.firstElementChild && typeof root.querySelectorAll === 'function') {
+        try {
+          const matches = root.querySelectorAll(COMPUTED_CANDIDATE_SELECTOR);
+          for (let j = 0; j < matches.length; j++) {
+            enqueueComputedCandidate(matches[j]);
+          }
+        } catch {
+          // 容錯防禦
+        }
+      }
+    }
+  }
+
+  /**
+   * 捲動結束後恢復空閒計算樣式修補排程
+   */
+  function onScrollSettled() {
+    isUserScrolling = false;
+    if (hasDeferredIdlePatch) {
+      hasDeferredIdlePatch = false;
+      scheduleIdleComputedStylePatch();
+    }
+  }
+
+  /**
+   * 掛載被動式捲動守衛（優先使用原生 scrollend，搭配 180ms 防抖降級）
+   */
+  function ensureScrollGuard() {
+    if (isScrollGuardAttached || typeof window === 'undefined' || typeof window.addEventListener !== 'function') {
+      return;
+    }
+    isScrollGuardAttached = true;
+
+    window.addEventListener('scroll', () => {
+      isUserScrolling = true;
+      if (scrollEndFallbackTimer !== null && typeof clearTimeout === 'function') {
+        clearTimeout(scrollEndFallbackTimer);
+      }
+      if (typeof setTimeout === 'function') {
+        scrollEndFallbackTimer = setTimeout(() => {
+          scrollEndFallbackTimer = null;
+          onScrollSettled();
+        }, 180);
+      }
+    }, { passive: true });
+
+    if ('onscrollend' in window) {
+      window.addEventListener('scrollend', () => {
+        if (scrollEndFallbackTimer !== null && typeof clearTimeout === 'function') {
+          clearTimeout(scrollEndFallbackTimer);
+          scrollEndFallbackTimer = null;
+        }
+        onScrollSettled();
+      }, { passive: true });
+    }
+  }
+
+  /**
    * 特例二：針對含有跨域樣式表的頁面，在主執行緒空閒時進行計算樣式抽樣修補
-   * 採用「4ms 時間切片 + 增量佇列 + 兩階段讀寫分離（Batch Read -> Batch Write）」，徹底消除同步長任務與 Style Thrashing
+   * 採用「4ms 時間切片 + computedCandidateSet 增量佇列 + 兩階段讀寫分離」，徹底消除重複全頁查詢與 Style Thrashing
    * @param {IdleDeadline} [deadline] 瀏覽器傳入之 IdleDeadline 物件
    */
   function patchComputedStyles(deadline) {
     if (typeof document === 'undefined' || typeof window === 'undefined') return;
 
-    // 若佇列已消化完畢或尚未初始化，初次建立候選目標清單
-    if (computedCandidates.length === 0 || computedCursor >= computedCandidates.length) {
-      const sampleTargets = document.querySelectorAll(
-        'h1, h2, h3, h4, h5, h6, [class*="title"], [class*="heading"], [class*="card"] a, [class*="post"] a, main, article, section, header, p, code, pre, [class*="content"], [class*="editor"], time, [class*="date"], [class*="meta"], [class*="author"], [class*="byline"], [class*="time"], [class*="published"]'
-      );
-      computedCandidates = Array.from(sampleTargets);
+    if (pendingCandidateRoots.length > 0) {
+      drainPendingCandidateRoots();
+    }
+
+    // 外部直接呼叫（如測試或手動觸發）且佇列已空時保留全頁 fallback；排程模式僅於初次載入進行單次全頁種子建置
+    if (!isRunningScheduledPatch && (computedCandidates.length === 0 || computedCursor >= computedCandidates.length)) {
+      const sampleTargets = document.querySelectorAll(COMPUTED_CANDIDATE_SELECTOR);
+      computedCandidates = [];
       computedCursor = 0;
+      for (let i = 0; i < sampleTargets.length; i++) {
+        enqueueComputedCandidate(sampleTargets[i]);
+      }
+    } else if (isRunningScheduledPatch && !hasInitialComputedSeed && document.readyState !== 'loading') {
+      hasInitialComputedSeed = true;
+      const sampleTargets = document.querySelectorAll(COMPUTED_CANDIDATE_SELECTOR);
+      for (let i = 0; i < sampleTargets.length; i++) {
+        enqueueComputedCandidate(sampleTargets[i]);
+      }
     }
 
     const totalLen = computedCandidates.length;
+    if (computedCursor >= totalLen) {
+      computedCandidates = [];
+      computedCursor = 0;
+      return;
+    }
+
     const pendingWrites = [];
-    const isSliceMode = Boolean(deadline || isIdlePatchScheduled);
+    const isSliceMode = Boolean(deadline || isIdlePatchScheduled || isRunningScheduledPatch);
     const sliceStart = typeof performance !== 'undefined' && performance.now ? performance.now() : Date.now();
 
     // 第一階段（Batch Read）：純讀取 getComputedStyle 並收集待修補節點
@@ -1248,17 +1388,29 @@
       }
     }
 
-    // 第二階段（Batch Write）：一次性批次寫入所有樣式變更，使瀏覽器僅需單次樣式樹重算
+    // 第二階段（Batch Write）：一次性批次寫入所有樣式變更，並排空 MutationObserver 回音避免二次微任務
     const writeLen = pendingWrites.length;
-    for (let i = 0; i < writeLen; i++) {
-      const item = pendingWrites[i];
-      if (item.el && item.el.style) {
-        setStylePropertyInternal(item.el.style, 'font-family', item.targetFont, 'important');
+    if (writeLen > 0) {
+      const prevInternal = isInternalStyleWrite;
+      isInternalStyleWrite = true;
+      try {
+        for (let i = 0; i < writeLen; i++) {
+          const item = pendingWrites[i];
+          if (item.el && item.el.style) {
+            item.el.style.setProperty('font-family', item.targetFont, 'important');
+          }
+        }
+        const docObs = rootToObserverMap.get(document);
+        if (docObs && typeof docObs.takeRecords === 'function') {
+          docObs.takeRecords();
+        }
+      } finally {
+        isInternalStyleWrite = prevInternal;
       }
     }
 
     // 自動續排：若本輪切片時間用盡但佇列尚未消化完畢，自動排程下一次空閒批次推進
-    if (computedCursor < computedCandidates.length) {
+    if (computedCursor < computedCandidates.length || pendingCandidateRoots.length > 0) {
       scheduleIdleComputedStylePatch();
     } else {
       computedCandidates = [];
@@ -1267,15 +1419,29 @@
   }
 
   /**
-   * 排程空閒時間執行計算樣式修補（僅在存在無法同源改寫之跨域樣式表時啟動）
+   * 排程空閒時間執行計算樣式修補（僅在存在無法同源改寫之跨域樣式表且非捲動期間啟動）
    */
   function scheduleIdleComputedStylePatch() {
     if (!hasCorsSheets || isIdlePatchScheduled || typeof window === 'undefined') return;
+    ensureScrollGuard();
+    if (isUserScrolling) {
+      hasDeferredIdlePatch = true;
+      return;
+    }
     isIdlePatchScheduled = true;
 
     const runner = (deadline) => {
       isIdlePatchScheduled = false;
-      patchComputedStyles(deadline);
+      if (isUserScrolling) {
+        hasDeferredIdlePatch = true;
+        return;
+      }
+      isRunningScheduledPatch = true;
+      try {
+        patchComputedStyles(deadline);
+      } finally {
+        isRunningScheduledPatch = false;
+      }
     };
 
     if (typeof window !== 'undefined' && typeof window.requestIdleCallback === 'function') {
@@ -1528,6 +1694,7 @@
     const observer = new MutationObserver(wrap('phase2Observer', (mutations) => {
       let shouldScanStylesheets = false;
       let hasAddedElements = false;
+      let hasNewComputedCandidates = false;
       let modifiedStyleTargets = null;
       let containerSet = null;
 
@@ -1608,6 +1775,10 @@
                 continue;
               }
 
+              if (hasCorsSheets && queueAddedCandidateRoot(node)) {
+                hasNewComputedCandidates = true;
+              }
+
               if (node.shadowRoot) {
                 processShadowRoot(node.shadowRoot);
               }
@@ -1682,11 +1853,12 @@
       if (shouldScanStylesheets) {
         scanAndPatchStyleSheets(targetDoc);
       }
-      if (hasAddedElements && hasCorsSheets) {
+      if (hasCorsSheets && (hasNewComputedCandidates || !hasInitialComputedSeed || computedCursor < computedCandidates.length)) {
         scheduleIdleComputedStylePatch();
       }
     }));
 
+    rootToObserverMap.set(targetDoc, observer);
     observer.observe(targetNode, {
       childList: true,
       subtree: true,
@@ -1883,7 +2055,7 @@
     // 7. window load 完成後若存在跨域樣式表，執行一次 computed style patch
     if (typeof window !== 'undefined') {
       window.addEventListener('load', () => {
-        if (hasCorsSheets) {
+        if (hasCorsSheets && (!hasInitialComputedSeed || pendingCandidateRoots.length > 0 || computedCursor < computedCandidates.length)) {
           scheduleIdleComputedStylePatch();
         }
       }, { once: true });
