@@ -924,4 +924,19 @@ describe('DOM / CSSOM 與特例整合測試', () => {
     expect(window.__fpProf.n.processRules).toBeGreaterThanOrEqual(2);
     expect(window.__fpProf.d.processRules).toBe(0);
   });
+
+  it('25. CSSOM 掃描應前置 --font-* 字型家族變數，但不得污染 --font-size / --font-weight 等數值變數 (Round 5A)', () => {
+    const { document, exports } = createEnvironment();
+    const styleEl = document.createElement('style');
+    styleEl.textContent = ':root { --font-sans: Inter, sans-serif; --font-size: 16px; --font-weight-bold: 700; --font-display: swap; }';
+    document.head.appendChild(styleEl);
+
+    exports.processStyleSheet(styleEl.sheet);
+
+    const rootStyle = styleEl.sheet.cssRules[0].style;
+    expect(rootStyle.getPropertyValue('--font-sans')).toContain('Google Sans');
+    expect(rootStyle.getPropertyValue('--font-size').trim()).toBe('16px');
+    expect(rootStyle.getPropertyValue('--font-weight-bold').trim()).toBe('700');
+    expect(rootStyle.getPropertyValue('--font-display').trim()).toBe('swap');
+  });
 });

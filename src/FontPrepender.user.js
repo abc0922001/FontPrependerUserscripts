@@ -103,8 +103,10 @@
   // CSS 保留系統關鍵字
   const CSS_SYSTEM_KEYWORDS_REGEX = /^(?:inherit|initial|unset|revert|revert-layer)$/i;
 
-  // CSS 字型自訂變數特徵
+  // CSS 字型自訂變數特徵（涵蓋 --font-sans 前綴、--code-font 後綴與 --body-font-family 中綴命名）
   const CSS_VAR_FONT_REGEX = /^--.*(?:font|family)/i;
+  // 非字型家族之排版自訂變數（排除 size/weight/style/display/stretch/variant/feature/kerning/smoothing）
+  const NON_FAMILY_FONT_VAR_REGEX = /(?:^|-)font-(?:size|weight|style|display|stretch|variant|feature|kerning|smoothing)(?=$|[-_])/i;
 
   // 非文本節點子樹剪枝特徵（跳過完全不包含排版文本之大型節點）
   const PRUNE_TAG_REGEX = /^(?:SCRIPT|STYLE|SVG|PATH|NOSCRIPT|IFRAME|CANVAS|VIDEO|AUDIO|HEAD|META|LINK)$/i;
@@ -308,6 +310,15 @@
       }
     }
     return false;
+  }
+
+  /**
+   * 判斷 CSS 自訂屬性宣告是否為字型家族變數（排除字級、字重等非家族排版變數）
+   * @param {string} propName 自訂屬性名稱（含 -- 前綴）
+   * @returns {boolean} 是否應前置字型
+   */
+  function isFontFamilyVarDecl(propName) {
+    return CSS_VAR_FONT_REGEX.test(propName) && !NON_FAMILY_FONT_VAR_REGEX.test(propName);
   }
 
   /**
@@ -716,50 +727,6 @@
   }
 
   /**
-   * 推進 SMI 整數大括號偏移堆疊（零字串切片與物件配置，遇到註解與字串字面量安全跳過）
-   * @param {string} cssText 原始 CSS 文字
-   * @param {number} fromIdx 起始掃描索引
-   * @param {number} toIdx 目標掃描索引
-   * @param {number[]} braceStack 大括號偏移堆疊
-   * @returns {number} 掃描結束索引
-   */
-  function advanceBraceStack(cssText, fromIdx, toIdx, braceStack) {
-    let i = fromIdx;
-    while (i < toIdx) {
-      const ch = cssText.charCodeAt(i);
-      if (ch === 123) {
-        braceStack.push(i);
-        i++;
-      } else if (ch === 125) {
-        if (braceStack.length > 0) braceStack.pop();
-        i++;
-      } else if (ch === 34 || ch === 39) {
-        const quote = ch;
-        i++;
-        while (i < toIdx) {
-          const sc = cssText.charCodeAt(i);
-          if (sc === 92) {
-            i += 2;
-            continue;
-          }
-          if (sc === quote) {
-            i++;
-            break;
-          }
-          i++;
-        }
-      } else if (ch === 47 && cssText.charCodeAt(i + 1) === 42) {
-        const closeIdx = cssText.indexOf('*/', i + 2);
-        if (closeIdx === -1) return toIdx;
-        i = closeIdx + 2;
-      } else {
-        i++;
-      }
-    }
-    return i;
-  }
-
-  /**
    * 由指定 '{' 偏移位置逆向提取該區塊之選擇器或 @規則標頭
    * @param {string} cssText 原始 CSS 文字
    * @param {number} openBraceIdx '{' 索引位置
@@ -789,7 +756,8 @@
 
   /**
    * 自跨域樣式表原始文字中僅萃取有異動 font-family 或字型變數之最小規則集合
-   * 採用 indexOf 跳躍掃描與 SMI 整數堆疊，免除對 95%+ 無關規則配置物件與切片
+   * 將 font-family 與 --*font* 兩條命中串流依偏移量合併為單趟掃描，共用同一個 SMI 大括號堆疊；
+   * 結構字元（{ } 引號 註解）以原生 indexOf 跳躍並快取下一個位置，免除逐字元 JS 迴圈
    * @param {string} cssText 原始 CSS 文字
    * @returns {string} 僅包含字型覆寫規則之精簡 CSS 文字
    */
@@ -797,13 +765,78 @@
     if (!cssText || typeof cssText !== 'string') return '';
     const hasLower = cssText.indexOf('font-family') !== -1;
     const searchStr = hasLower ? cssText : (/font-family/i.test(cssText) ? cssText.toLowerCase() : '');
-    const hasFontVar = cssText.indexOf('--') !== -1 && /--[\w-]*(?:font|family)\s*:/i.test(cssText);
-    if (!searchStr && !hasFontVar) return '';
+    const varRegex = cssText.indexOf('--') !== -1 ? /--[\w-]*(?:font|family)[\w-]*(?=\s*:)/gi : null;
+    let varMatch = varRegex ? varRegex.exec(cssText) : null;
+    let fontIdx = searchStr ? searchStr.indexOf('font-family', 0) : -1;
+    if (fontIdx === -1 && varMatch === null) return '';
 
     const len = cssText.length;
     const braceStack = [];
     const headerCache = new Map();
     const skipHeaderRegex = /^@(?:-[a-z]+-)?(?:font-face|font-palette-values|font-feature-values|keyframes|property|counter-style|page)\b/i;
+
+    // 單調前進之結構字元掃描游標與各結構字元下一個位置快取（-2 代表尚未查詢，-1 代表後續已不存在，永不重查）
+    let cursor = 0;
+    let nextOpen = -2;
+    let nextClose = -2;
+    let nextDq = -2;
+    let nextSq = -2;
+    let nextComment = -2;
+    let nextNewline = -2;
+
+    // 推進大括號堆疊至 toIdx（安全跳過註解與字串字面量；字串依 CSS 規範於換行處終止）
+    const advanceTo = (toIdx) => {
+      while (cursor < toIdx) {
+        if (nextOpen !== -1 && nextOpen < cursor) nextOpen = cssText.indexOf('{', cursor);
+        if (nextClose !== -1 && nextClose < cursor) nextClose = cssText.indexOf('}', cursor);
+        if (nextDq !== -1 && nextDq < cursor) nextDq = cssText.indexOf('"', cursor);
+        if (nextSq !== -1 && nextSq < cursor) nextSq = cssText.indexOf("'", cursor);
+        if (nextComment !== -1 && nextComment < cursor) nextComment = cssText.indexOf('/*', cursor);
+
+        let pos = toIdx;
+        let kind = 0;
+        if (nextOpen !== -1 && nextOpen < pos) { pos = nextOpen; kind = 1; }
+        if (nextClose !== -1 && nextClose < pos) { pos = nextClose; kind = 2; }
+        if (nextDq !== -1 && nextDq < pos) { pos = nextDq; kind = 3; }
+        if (nextSq !== -1 && nextSq < pos) { pos = nextSq; kind = 3; }
+        if (nextComment !== -1 && nextComment < pos) { pos = nextComment; kind = 4; }
+
+        if (kind === 0) {
+          cursor = toIdx;
+        } else if (kind === 1) {
+          braceStack.push(pos);
+          cursor = pos + 1;
+        } else if (kind === 2) {
+          if (braceStack.length > 0) braceStack.pop();
+          cursor = pos + 1;
+        } else if (kind === 4) {
+          const closeIdx = cssText.indexOf('*/', pos + 2);
+          cursor = closeIdx === -1 ? len : closeIdx + 2;
+        } else {
+          const quote = cssText.charAt(pos);
+          if (nextNewline !== -1 && nextNewline <= pos) nextNewline = cssText.indexOf('\n', pos + 1);
+          let searchFrom = pos + 1;
+          for (;;) {
+            const endQ = cssText.indexOf(quote, searchFrom);
+            if (endQ === -1 || (nextNewline !== -1 && nextNewline < endQ)) {
+              cursor = nextNewline !== -1 ? nextNewline + 1 : len;
+              break;
+            }
+            let backslashes = 0;
+            let k = endQ - 1;
+            while (k > pos && cssText.charCodeAt(k) === 92) {
+              backslashes++;
+              k--;
+            }
+            if ((backslashes & 1) === 0) {
+              cursor = endQ + 1;
+              break;
+            }
+            searchFrom = endQ + 1;
+          }
+        }
+      }
+    };
 
     const getHeader = (braceIdx) => {
       let h = headerCache.get(braceIdx);
@@ -815,12 +848,12 @@
     };
 
     let out = '';
-    const emitBlock = (stack, declStr) => {
-      if (!declStr || stack.length === 0) return;
+    const emitBlock = (declStr) => {
+      if (!declStr || braceStack.length === 0) return;
       let prefix = '';
       let suffix = '';
-      for (let k = 0; k < stack.length; k++) {
-        const hdr = getHeader(stack[k]);
+      for (let k = 0; k < braceStack.length; k++) {
+        const hdr = getHeader(braceStack[k]);
         if (!hdr) return;
         if (hdr.charCodeAt(0) === 64 && skipHeaderRegex.test(hdr)) return;
         prefix += hdr + '{';
@@ -829,115 +862,124 @@
       out += prefix + declStr + suffix + '\n';
     };
 
-    if (searchStr) {
-      let scanCursor = 0;
-      let idx = searchStr.indexOf('font-family', 0);
-      while (idx !== -1) {
-        const prevCh = idx > 0 ? cssText.charCodeAt(idx - 1) : 0;
-        let p = idx + 11;
-        while (p < len && cssText.charCodeAt(p) <= 32) p++;
-        const isValidPropStart =
-          prevCh !== 45 &&
-          prevCh !== 95 &&
-          !(prevCh >= 97 && prevCh <= 122) &&
-          !(prevCh >= 65 && prevCh <= 90) &&
-          !(prevCh >= 48 && prevCh <= 57);
-
-        if (isValidPropStart && p < len && cssText.charCodeAt(p) === 58) {
-          p++;
-          while (p < len && cssText.charCodeAt(p) <= 32) p++;
-          const valStart = p;
-          let endIdx = p;
-          let bangIdx = -1;
+    // 宣告值解析結果（閉包變數避免每次配置物件）
+    let declValStart = 0;
+    let declValEnd = 0;
+    let declEnd = 0;
+    let declImportant = false;
+    // 自冒號後之位置解析宣告值範圍、結尾與 !important 旗標
+    const parseDeclValue = (afterColon) => {
+      let p = afterColon;
+      while (p < len && cssText.charCodeAt(p) <= 32) p++;
+      const valStart = p;
+      let endIdx = p;
+      let bangIdx = -1;
+      while (endIdx < len) {
+        const c = cssText.charCodeAt(endIdx);
+        if (c === 59 || c === 125) break;
+        if (c === 34 || c === 39) {
+          endIdx++;
           while (endIdx < len) {
-            const c = cssText.charCodeAt(endIdx);
-            if (c === 59 || c === 125) break;
-            if (c === 34 || c === 39) {
-              const q = c;
-              endIdx++;
-              while (endIdx < len) {
-                const sc = cssText.charCodeAt(endIdx);
-                if (sc === 92) {
-                  endIdx += 2;
-                  continue;
-                }
-                if (sc === q) {
-                  endIdx++;
-                  break;
-                }
-                endIdx++;
-              }
+            const sc = cssText.charCodeAt(endIdx);
+            if (sc === 92) {
+              endIdx += 2;
               continue;
             }
-            if (c === 33 && bangIdx === -1) bangIdx = endIdx;
             endIdx++;
+            if (sc === c) break;
           }
-
-          let valEnd = bangIdx !== -1 ? bangIdx : endIdx;
-          let hasImportant = false;
-          if (bangIdx !== -1) {
-            let bStart = bangIdx + 1;
-            let bEnd = endIdx;
-            while (bStart < bEnd && cssText.charCodeAt(bStart) <= 32) bStart++;
-            while (bEnd > bStart && cssText.charCodeAt(bEnd - 1) <= 32) bEnd--;
-            if (bEnd - bStart === 9 && (cssText.startsWith('important', bStart) || /^important$/i.test(cssText.slice(bStart, bEnd)))) {
-              hasImportant = true;
-            } else {
-              valEnd = endIdx;
-            }
-          }
-          while (valEnd > valStart && cssText.charCodeAt(valEnd - 1) <= 32) valEnd--;
-
-          if (valEnd > valStart) {
-            scanCursor = advanceBraceStack(cssText, scanCursor, idx, braceStack);
-            if (braceStack.length > 0) {
-              let selector = '';
-              let shouldSkip = false;
-              for (let k = braceStack.length - 1; k >= 0; k--) {
-                const hdr = getHeader(braceStack[k]);
-                if (!hdr) continue;
-                if (hdr.charCodeAt(0) === 64) {
-                  if (skipHeaderRegex.test(hdr)) {
-                    shouldSkip = true;
-                    break;
-                  }
-                } else if (!selector) {
-                  selector = hdr;
-                }
-              }
-              if (!shouldSkip) {
-                const fontVal = cssText.slice(valStart, valEnd);
-                const prepended = prependFontFamily(fontVal, selector);
-                if (prepended && prepended !== fontVal) {
-                  emitBlock(braceStack, 'font-family:' + prepended + (hasImportant ? '!important;' : ';'));
-                }
-              }
-            }
-          }
-          idx = searchStr.indexOf('font-family', endIdx);
+          continue;
+        }
+        if (c === 33 && bangIdx === -1) bangIdx = endIdx;
+        endIdx++;
+      }
+      let valEnd = bangIdx !== -1 ? bangIdx : endIdx;
+      let hasImportant = false;
+      if (bangIdx !== -1) {
+        let bStart = bangIdx + 1;
+        let bEnd = endIdx;
+        while (bStart < bEnd && cssText.charCodeAt(bStart) <= 32) bStart++;
+        while (bEnd > bStart && cssText.charCodeAt(bEnd - 1) <= 32) bEnd--;
+        if (bEnd - bStart === 9 && (cssText.startsWith('important', bStart) || /^important$/i.test(cssText.slice(bStart, bEnd)))) {
+          hasImportant = true;
         } else {
-          idx = searchStr.indexOf('font-family', idx + 11);
+          valEnd = endIdx;
         }
       }
-    }
+      while (valEnd > valStart && cssText.charCodeAt(valEnd - 1) <= 32) valEnd--;
+      declValStart = valStart;
+      declValEnd = valEnd;
+      declEnd = endIdx;
+      declImportant = hasImportant;
+    };
 
-    if (hasFontVar) {
-      const varBraceStack = [];
-      let varScanCursor = 0;
-      const varRegex = /(--[\w-]*(?:font|family))\s*:\s*([^;!}]+)(!important)?/gi;
-      let m;
-      while ((m = varRegex.exec(cssText)) !== null) {
-        const propName = m[1];
-        const rawVal = m[2] ? m[2].trim() : '';
-        if (!rawVal || CSS_SYSTEM_KEYWORDS_REGEX.test(rawVal)) continue;
-        const isMonoVar = /mono|code/i.test(propName) || isMonospace('', rawVal, false);
-        if (isAlreadyPrepended(rawVal, isMonoVar)) continue;
-        varScanCursor = advanceBraceStack(cssText, varScanCursor, m.index, varBraceStack);
-        if (varBraceStack.length > 0) {
-          const prependStr = isMonoVar ? MONO_PREPEND_STR : SANS_PREPEND_STR;
-          emitBlock(varBraceStack, propName + ':' + prependStr + rawVal + (m[3] ? '!important;' : ';'));
+    while (fontIdx !== -1 || varMatch !== null) {
+      // 依偏移量合併兩條命中串流，保證大括號游標單調前進
+      if (varMatch !== null && (fontIdx === -1 || varMatch.index < fontIdx)) {
+        const propName = varMatch[0];
+        const varIdx = varMatch.index;
+        let p = varIdx + propName.length;
+        while (p < len && cssText.charCodeAt(p) <= 32) p++;
+        parseDeclValue(p + 1);
+        if (declValEnd > declValStart) {
+          const rawVal = cssText.slice(declValStart, declValEnd);
+          if (isFontFamilyVarDecl(propName) && !CSS_SYSTEM_KEYWORDS_REGEX.test(rawVal)) {
+            const isMonoVar = /mono|code/i.test(propName) || isMonospace('', rawVal, false);
+            if (!isAlreadyPrepended(rawVal, isMonoVar)) {
+              advanceTo(varIdx);
+              emitBlock(propName + ':' + (isMonoVar ? MONO_PREPEND_STR : SANS_PREPEND_STR) + rawVal + (declImportant ? '!important;' : ';'));
+            }
+          }
+        }
+        if (varRegex.lastIndex < declEnd) varRegex.lastIndex = declEnd;
+        varMatch = varRegex.exec(cssText);
+        continue;
+      }
+
+      const idx = fontIdx;
+      const prevCh = idx > 0 ? cssText.charCodeAt(idx - 1) : 0;
+      let p = idx + 11;
+      while (p < len && cssText.charCodeAt(p) <= 32) p++;
+      const isValidPropStart =
+        prevCh !== 45 &&
+        prevCh !== 95 &&
+        !(prevCh >= 97 && prevCh <= 122) &&
+        !(prevCh >= 65 && prevCh <= 90) &&
+        !(prevCh >= 48 && prevCh <= 57);
+
+      if (!isValidPropStart || p >= len || cssText.charCodeAt(p) !== 58) {
+        fontIdx = searchStr.indexOf('font-family', idx + 11);
+        continue;
+      }
+
+      parseDeclValue(p + 1);
+      if (declValEnd > declValStart) {
+        advanceTo(idx);
+        if (braceStack.length > 0) {
+          let selector = '';
+          let shouldSkip = false;
+          for (let k = braceStack.length - 1; k >= 0; k--) {
+            const hdr = getHeader(braceStack[k]);
+            if (!hdr) continue;
+            if (hdr.charCodeAt(0) === 64) {
+              if (skipHeaderRegex.test(hdr)) {
+                shouldSkip = true;
+                break;
+              }
+            } else if (!selector) {
+              selector = hdr;
+            }
+          }
+          if (!shouldSkip) {
+            const fontVal = cssText.slice(declValStart, declValEnd);
+            const prepended = prependFontFamily(fontVal, selector);
+            if (prepended && prepended !== fontVal) {
+              emitBlock('font-family:' + prepended + (declImportant ? '!important;' : ';'));
+            }
+          }
         }
       }
+      fontIdx = searchStr.indexOf('font-family', declEnd);
     }
 
     return out;
@@ -1083,7 +1125,7 @@
               const propName = style[p];
               if (propName && propName.charCodeAt(0) === 45 && propName.charCodeAt(1) === 45 && CSS_VAR_FONT_REGEX.test(propName)) {
                 const varVal = style.getPropertyValue(propName);
-                if (varVal && !CSS_SYSTEM_KEYWORDS_REGEX.test(varVal.trim())) {
+                if (varVal && isFontFamilyVarDecl(propName) && !CSS_SYSTEM_KEYWORDS_REGEX.test(varVal.trim())) {
                   const isMonoVar = /mono|code/i.test(propName) || isMonospace('', varVal, false);
                   if (!isAlreadyPrepended(varVal, isMonoVar)) {
                     const prependStr = isMonoVar ? MONO_PREPEND_STR : SANS_PREPEND_STR;

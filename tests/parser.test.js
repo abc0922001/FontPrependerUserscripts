@@ -18,6 +18,7 @@ function loadUserscript(sandbox = {}) {
 const {
   prependFontFamily,
   rewriteCssContent,
+  extractFontOverrideCss,
   isIconFont,
   isMonospace,
   isAlreadyPrepended,
@@ -236,6 +237,41 @@ describe('字型堆疊解析與前置引擎 (Font Stack Parser & Prepender)', ()
       expect(neutralFontCache.has('"FontUnique-0", sans-serif')).toBe(false); // 第 0 筆被淘汰
       expect(neutralFontCache.has('"FontUnique-1", sans-serif')).toBe(true);  // 第 1 筆依然存在
       expect(neutralFontCache.has('"FontUnique-1000", sans-serif')).toBe(true);
+    });
+  });
+
+  // Round 5A: extractFontOverrideCss 字型變數命名判定與單趟掃描正確性
+  describe('7. 跨域樣式表最小規則萃取 (extractFontOverrideCss)', () => {
+    it('應擷取前綴、後綴與中綴命名之字型家族變數（--font-sans、--font-mono、--font-primary 等）', () => {
+      const css = ':root{--font-sans:Inter,sans-serif;--font-mono:"Fira Code",monospace;--font-primary:"proxima-nova",sans-serif;--code-font:Menlo,monospace;--heading-font-family:Georgia,serif}';
+      const out = extractFontOverrideCss(css);
+      expect(out).toContain(`:root{--font-sans:${SANS_PREPEND_STR}Inter,sans-serif;}`);
+      expect(out).toContain(`:root{--font-mono:${MONO_PREPEND_STR}"Fira Code",monospace;}`);
+      expect(out).toContain(`:root{--font-primary:${SANS_PREPEND_STR}"proxima-nova",sans-serif;}`);
+      expect(out).toContain(`:root{--code-font:${MONO_PREPEND_STR}Menlo,monospace;}`);
+      expect(out).toContain(`:root{--heading-font-family:${SANS_PREPEND_STR}Georgia,serif;}`);
+    });
+
+    it('應排除字級、字重等非字型家族排版變數，避免破壞數值語意', () => {
+      const css = ':root{--font-size:16px;--font-size-lg:1.25rem;--font-weight:700;--font-style:italic;--font-stretch:condensed;--font-variant:small-caps;--font-feature-settings:"liga" 1;--font-kerning:normal;--font-smoothing:antialiased;--font-display:swap;--font-display-fallback:fallback;--heading-font-weight:600}';
+      expect(extractFontOverrideCss(css)).toBe('');
+    });
+
+    it('單趟掃描應保留 @media / @layer 巢狀、跳過 @font-face，並忽略字串與註解中的大括號', () => {
+      const css = [
+        '.a::before{content:"}{"}',
+        '/* } { */',
+        "@font-face{font-family:'X';src:url(x.woff2)}",
+        '@media (min-width:1px){@layer base{.c{font-family:Roboto;--body-font:Lato,sans-serif !important}}}',
+        '.d{font-family:Arial !important}',
+        '.fa-icon{font-family:sans-serif}'
+      ].join('');
+      const out = extractFontOverrideCss(css);
+      expect(out).toContain(`@media (min-width:1px){@layer base{.c{font-family:${SANS_PREPEND_STR}Roboto;}}}`);
+      expect(out).toContain(`@media (min-width:1px){@layer base{.c{--body-font:${SANS_PREPEND_STR}Lato,sans-serif!important;}}}`);
+      expect(out).toContain(`.d{font-family:${SANS_PREPEND_STR}Arial!important;}`);
+      expect(out).not.toContain("'X'");
+      expect(out).not.toContain('.fa-icon');
     });
   });
 });
